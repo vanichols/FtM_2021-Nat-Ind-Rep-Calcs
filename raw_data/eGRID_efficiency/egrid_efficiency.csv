@@ -1,0 +1,16 @@
+year,lb_CO2_MWh,source
+1996,1449.53,file eGRID1996_location.xls tab EGRDUS96
+1997,1470.095,file eGRID1997_location.xls tab EGRDUS97
+1998,1422.603,file eGRID1998_location.xls tab EGRDUS98
+1999,1400.475,file eGRID1999_location.xls tab EGRDUS99
+2000,1392.488,file eGRID2000_location.xls tab EGRDUS00
+2004,1363.001,file eGRID2004_aggregation.xls tab EGRDUS04
+2005,1329.3469,file eGRID2005_aggregation.xls tab US05
+2007,1293.0476,file eGRID2007_aggregation.xls tab US07
+2009,1216.1784,file eGRID2009_data.xls tab US09
+2010,1232.3476,file eGRID2010_data.xls tab US10
+2012,1136.529,file eGRID2012_data.xls tab US12
+2014,1122.904,file eGRID2014_Data_v2.xlsx tab US14
+2016,998.443,file egrid2016_data.xlsx tab US16
+2018,947.182,file egrid2018_data_v2.xlsx tab US18
+2019,884.23,file egrid2019_data.xlsx tab US19
