@@ -1,0 +1,45 @@
+crop,year,percent_area_burned
+Barley,1990,1
+Barley,2005,0.05
+Barley,2013,1
+Barley,2014,1
+"Corn, grain",1990,0.05
+"Corn, grain",2005,0.05
+"Corn, grain",2013,0.05
+"Corn, grain",2014,0.05
+"Corn, silage",1990,0.05
+"Corn, silage",2005,0.05
+"Corn, silage",2013,0.05
+"Corn, silage",2014,0.05
+Cotton,1990,1
+Cotton,2005,1
+Cotton,2013,1
+Cotton,2014,1
+Peanuts,1990,3
+Peanuts,2005,3
+Peanuts,2013,3
+Peanuts,2014,3
+Potatoes,1990,0.05
+Potatoes,2005,0.05
+Potatoes,2013,0.05
+Potatoes,2014,0.05
+Rice,1990,8
+Rice,2005,8
+Rice,2013,4
+Rice,2014,6
+Sorghum,1990,1
+Sorghum,2005,1
+Sorghum,2013,1
+Sorghum,2014,1
+Soybeans,1990,0.05
+Soybeans,2005,0.05
+Soybeans,2013,1
+Soybeans,2014,1
+Sugar beets,1990,0.05
+Sugar beets,2005,0.05
+Sugar beets,2013,0.05
+Sugar beets,2014,0.05
+Wheat,1990,1
+Wheat,2005,2
+Wheat,2013,2
+Wheat,2014,1
