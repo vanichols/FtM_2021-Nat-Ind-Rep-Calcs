@@ -1,0 +1,1320 @@
+---
+title: "NIR Processing"
+author: "Eric Coronel and Gina Nichols"
+date: "3/25/2021, gn-6/16/2022"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+# R Packages And Other Global Options
+
+library(tidyverse)
+library(readxl)
+library(usdarnass)
+library(zoo)
+
+#nass_set_key("40DCDA93-B5E8-33FB-B96F-47902CD5E5A0") # for NASS API queries
+options(scipen = 999)
+
+# Custom Functions
+
+coronel_qc <- function(data, batch_name = "_regular") {
+  
+  vector_names <- names(data) %>% 
+    tail(n = length(names(data)) - 2)
+  
+  for (i in 1:length(vector_names)) {
+    graph01 <- ggplot(data, aes(x = year, y = get(vector_names[i]), group = crop)) +
+      geom_line() +
+      geom_point() +
+      labs(title = paste(vector_names[i]), y = paste(vector_names[i])) +
+      facet_wrap(~ crop, scales = "free") +
+      geom_blank(aes(y = 0))
+    
+    print(paste(vector_names[i], "-", i, "out of", length(vector_names)))
+    ggsave(plot = graph01, filename = paste0("temp_qc_output/", str_pad(i, 2, pad = "0"), "_", vector_names[i],
+                                             batch_name, ".png"))
+  }
+}
+
+coronel_one_off_graph <- function(data, x, y) {
+  ggplot(data, aes(get(x), get(y))) +
+  geom_point() +
+  facet_wrap(~ crop, scales = "free") +
+      geom_blank(aes(y = 0))
+}
+
+coronel_loess <- function(data, x, y) {
+  ggplot(data, aes(get(x), get(y), group = crop)) +
+  geom_point() +
+  geom_line() +
+  geom_smooth(method = "loess", se = F) +
+  facet_wrap(~ crop, scales = "free") +
+      geom_blank(aes(y = 0))
+}
+
+```
+
+# 02 Clean, Substitute, Combine, Other Important Actions
+
+Last updated: 8/2/2019 (Kathy Xiong) - starting on 02/22/2021 (Eric Coronel)
+Purpose: Create a master dataset with one row per crop-year & all variables in columns
+Input: datasets in r_data/outputs_01.rda
+Output: master dataset in r_data/outputs_02.rda
+
+## 02 Load 01 Data If Needed
+```{r load_outputs_01_egc}
+load("r_data/outputs_01_egc.rda")
+```
+
+## 02 Cleaning NASS Land Use
+```{r clean_NASS_land_use}
+
+# NASS land use
+nass_land_use_2 <- 
+  nass_land_use %>% 
+  rename_all(tolower) %>% 
+  select(-commodity) %>% 
+  separate(`data item`, c("crop", "data_item"), sep = " - ")
+
+# convert cotton production to lbs (from 480 lb bales)
+# convert rice yield to cwt (from lbs)
+nass_land_use_3 <- nass_land_use_2 %>% 
+  mutate(
+    value_2 = case_when(
+      crop == "COTTON" & data_item == "PRODUCTION, MEASURED IN 480 LB BALES" ~ value * 480,
+      crop == "RICE" & data_item == "YIELD, MEASURED IN LB / ACRE" ~ value / 100, 
+      TRUE ~ value
+      ),
+    data_item_2 = case_when(
+      crop == "COTTON" & data_item == "PRODUCTION, MEASURED IN 480 LB BALES" ~ "PRODUCTION, MEASURED IN LB",
+      crop == "RICE" & data_item == "YIELD, MEASURED IN LB / ACRE" ~ "YIELD, MEASURED IN CWT / ACRE",
+      TRUE ~ data_item
+      )
+    )
+
+# reshape dataset
+nass_land_use_4 <- 
+  nass_land_use_3 %>% 
+  select(-data_item, -value) %>% 
+  rename(data_item = data_item_2,
+         value = value_2) %>% 
+  separate(data_item, c("data_item_short", "unit"), sep = ", ") %>% 
+  mutate(data_item_short = str_to_lower(data_item_short) %>% str_replace_all(" ", "_")) %>% 
+  select(-unit) %>% 
+  spread(data_item_short, value)
+
+# CORN: estimate acres planted for grain and silage
+# based on acres planted for crop overall, by assuming
+# equal loss ratio for grain and silage
+corn_harvested <- 
+  nass_land_use_4 %>% 
+  filter(crop %in% c("CORN, GRAIN", "CORN, SILAGE")) %>% 
+  separate(crop, c("crop", "grain_or_silage"), sep = ", ") %>% 
+  group_by(year, crop) %>% 
+  summarise(acres_harvested = sum(acres_harvested))
+
+corn_planted <- 
+  nass_land_use_4 %>% 
+  filter(crop == "CORN") %>% 
+  select(year, crop, acres_planted)
+
+corn <- 
+  corn_harvested %>%
+  left_join(corn_planted, by = c("year", "crop")) %>% 
+  mutate(pct_harvested = acres_harvested / acres_planted) %>% 
+  select(year, crop, pct_harvested)
+
+corn %>% 
+  ungroup() %>% 
+  summarise(pct_harv = mean(pct_harvested))
+
+d <- 
+  list(
+  crop = c("CORN, GRAIN", "CORN, SILAGE"),
+  year = seq(1980, 2020, by = 1) # error discovered here, the seq went up to 2018. egc - 04/21/2021
+)
+
+d <- 
+  cross_df(d) %>% 
+  separate(crop, c("crop_main", "grain_or_silage"), sep = ", ", remove = FALSE)
+
+corn_2 <- 
+  d %>% 
+  left_join(corn, by = c("year", "crop_main" = "crop")) %>% 
+  select(year, crop, pct_harvested)
+
+nass_land_use_5 <- 
+  nass_land_use_4 %>% 
+  left_join(corn_2, by = c("year", "crop")) %>% 
+  filter(crop != "CORN") %>% 
+  mutate(acres_planted = ifelse(crop %in% c("CORN, GRAIN", "CORN, SILAGE"),
+                                acres_harvested / pct_harvested,
+                                acres_planted)) %>% 
+  select(-pct_harvested) %>% 
+  mutate(crop = str_to_sentence(crop))
+
+# ratio of corn grain to corn silage, for use later
+corn_pct <- 
+  nass_land_use_5 %>% 
+  filter(crop %in% c("Corn, grain", "Corn, silage")) %>% 
+  select(year, crop, acres_planted) %>% 
+  group_by(year) %>% 
+  mutate(pct_corn_acres = acres_planted / sum(acres_planted)) %>% 
+  select(year, crop, pct_corn_acres)
+
+# gn - has pct of corn planted for grain changed over time?
+corn_pct %>% 
+  filter(grepl("grain", crop)) %>% 
+  ggplot(aes(year, pct_corn_acres)) + 
+  geom_line(color = "darkred") +
+  geom_point() + 
+  labs(title = "Percentage of planted corn acres dedicated to grain (vs silage) is increasing")
+
+
+# egc 02/24/2021: I am replacing Kathy's sorghum processing with the same processing as corn grain and silage. We then discard sorghum silage since it's not a Field to Market crop
+
+# sorghum: estimate acres planted for grain and silage
+# based on acres planted for crop overall, by assuming
+# equal loss ratio for grain and silage
+
+sorghum_harvested <- 
+  nass_land_use_4 %>% 
+  filter(crop %in% c("SORGHUM, GRAIN", "SORGHUM, SILAGE")) %>% 
+  separate(crop, c("crop", "grain_or_silage"), sep = ", ") %>% 
+  group_by(year, crop) %>% 
+  summarise(acres_harvested = sum(acres_harvested))
+
+sorghum_planted <- 
+  nass_land_use_4 %>% 
+  filter(crop == "SORGHUM") %>% 
+  select(year, crop, acres_planted)
+
+sorghum_egc <- 
+  sorghum_harvested %>%
+  left_join(sorghum_planted, by = c("year", "crop")) %>% 
+  mutate(pct_harvested = acres_harvested / acres_planted) %>% 
+  select(year, crop, pct_harvested)
+
+d <- 
+  list(
+  crop = c("SORGHUM, GRAIN", "SORGHUM, SILAGE"),
+  year = seq(1980, 2020, by = 1)
+)
+
+d <- 
+  cross_df(d) %>% 
+  separate(crop, c("crop_main", "grain_or_silage"), sep = ", ", remove = FALSE)
+
+sorghum_2_egc <- 
+  d %>% 
+  left_join(sorghum_egc, by = c("year", "crop_main" = "crop")) %>% 
+  select(year, crop, pct_harvested) %>% 
+  mutate(crop = str_to_sentence(crop))
+
+nass_land_use_6 <- 
+  nass_land_use_5 %>% 
+  left_join(sorghum_2_egc, by = c("year", "crop")) %>% 
+  filter(crop != "Sorghum") %>% 
+  mutate(acres_planted = ifelse(crop %in% c("Sorghum, grain", "Sorghum, silage"),
+                                acres_harvested / pct_harvested,
+                                acres_planted)) %>% 
+  select(-pct_harvested) %>% 
+  mutate(crop = str_to_sentence(crop))
+
+# ratio of sorghum grain to sorghum silage, for use later, egc (maybe, let's see)
+sorghum_pct <- 
+  nass_land_use_6 %>% 
+  filter(crop %in% c("Sorghum, grain", "Sorghum, silage")) %>% 
+  select(year, crop, acres_planted) %>% 
+  group_by(year) %>% 
+  mutate(pct_sorghum_acres = acres_planted / sum(acres_planted)) %>% 
+  select(year, crop, pct_sorghum_acres)
+
+# gn - has pct of corn planted for grain changed over time?
+sorghum_pct %>% 
+  filter(grepl("grain", crop)) %>% 
+  ggplot(aes(year, pct_sorghum_acres)) + 
+  geom_line(color = "darkred") +
+  geom_point() + 
+  labs(title = "Percentage of planted corn acres dedicated to grain (vs silage) is increasing")
+
+
+# Clean sugar beets sucrose content, this will be used when creating output 02
+sugarbeets_sucrose_pct_2 <- 
+  sugarbeets_sucrose_pct %>% 
+  mutate(year = as.numeric(year),
+         Value = as.numeric(Value)) %>% 
+  group_by(year) %>% 
+  summarize(sucrose_pct = round(mean(Value), 1)) %>% 
+  mutate(crop = "Sugar beets")
+
+#--gn sucrose over time?
+sugarbeets_sucrose_pct_2 %>% 
+  ggplot(aes(year, sucrose_pct)) + 
+  geom_line() + 
+  geom_point()
+
+# save final version
+nass_land_use_final <- 
+  nass_land_use_6 %>% 
+  filter(!(crop %in% c("Wheat, spring, (excl durum)", "Wheat, spring, durum", "Wheat, winter",
+                       "Sorghum, silage"))) %>% # egc - 03/18 remove crops for which we have no further use
+  mutate(crop = ifelse(test = crop == "Sorghum, grain", # rename to be consistent with other datasets
+                       yes = "Sorghum",
+                       no = crop)) %>% 
+  mutate(crop = ifelse(test = crop == "Sugarbeets", # rename to be consistent with other datasets
+                       yes = "Sugar beets",
+                       no = crop))
+```
+
+## 02 Clean NASS Chemicals
+
+```{r clean_NASS_chemicals}
+# NASS chemicals
+
+# what I see I need to do
+# Separate chemical data into fertilizer and chemicals
+# Fertilizer processing is the same, but with the removal of sulfur data
+# Separate into data < 1994 and data >= 1994
+# Separate chemical data into fungicide + herbicide + insecticide and OTHER
+# For data < 1994
+# Add ref table to partition the chemical, others appropriately, will need new columns
+# Sum up data together by chemical category - there will be no Other category, we only keep the categories for which we have multiplication factors
+# For data >= 1994
+# We add ref table data to again be able to distribute CHEMICAL, OTHER data into appropriate categories
+# Then we add these new totals into the respective total category (herbicide, fumigant, etc). There will be no Other category but we'll have new ones (fumigants, growth regulators)
+
+# Import updated ref table
+ref_table_pest <- read_csv("data_references/pesticide_codes.csv")
+
+
+ref_table_pest %>% 
+  select(type) %>% 
+  distinct()
+
+# Fertilizer data
+fertilizers_all_years <- 
+  nass_chemicals %>% 
+  filter(Domain == "FERTILIZER") %>% 
+  filter(`Domain Category` != "FERTILIZER: (SULFUR)") %>% 
+  select(-c(`Data Item`, Domain)) %>% 
+  rename(Domain = `Domain Category`) # This is ready
+
+fertilizers_all_years %>% 
+  pull(Domain) %>% 
+  unique()
+
+# Chemicals < 1994
+chemicals_before_1994 <- 
+  nass_chemicals %>% 
+  as_tibble() %>% 
+  filter(Domain != "FERTILIZER") %>% 
+  filter(Year < 1994) %>% 
+  # Separate to get chemical codes added via a left join
+  mutate(`Domain Category` = str_remove_all(`Domain Category`, "\\(|\\)")) %>% 
+  separate(`Domain Category`, into = c("ai", "code"), sep = " = ") %>% 
+  mutate(code = as.numeric(code)) %>% 
+  left_join(ref_table_pest, by = "code") %>% 
+  mutate(type_edited = paste("CHEMICAL,", toupper(type))) %>% 
+  mutate(Domain = ifelse(test = Domain == "CHEMICAL, OTHER",
+                                yes = type_edited,
+                                no = Domain)) %>% 
+  group_by(Year, Commodity, Domain) %>% 
+  summarize(Value = sum(Value)) # This is ready
+
+chemicals_before_1994 %>% 
+  ungroup() %>% 
+  select(Domain) %>% 
+  distinct()
+
+# Chemicals >= 1994
+# Excludes CHEMICAL, OTHER
+chemicals_after_1994_totals_only <- 
+  nass_chemicals %>% 
+  filter(Domain != "FERTILIZER") %>% 
+  filter(Year >= 1994) %>% 
+  filter(str_detect(`Domain Category`, "TOTAL")) %>% 
+  filter(Domain != "CHEMICAL, OTHER")
+
+chemicals_after_1994_others_only <- 
+  nass_chemicals %>% 
+  filter(Domain != "FERTILIZER") %>% 
+  filter(Year >= 1994) %>% 
+  filter(Domain == "CHEMICAL, OTHER") %>% 
+  filter(`Domain Category` != "CHEMICAL, OTHER: (TOTAL)") %>% 
+  filter(!is.na(Value)) %>% 
+  mutate(`Domain Category` = str_remove_all(`Domain Category`, "\\(|\\)")) %>% 
+  separate(`Domain Category`, into = c("ai", "code"), sep = " = ") %>% 
+  mutate(code = as.numeric(code)) %>% 
+  left_join(ref_table_pest, by = "code") %>% 
+  ungroup() %>% 
+  group_by(Year, Commodity, type) %>% 
+  summarize(Value = sum(Value)) %>% 
+  filter(type %in% c("Fumigant", "Fungicide", "Herbicide", "Growth Reg")) 
+
+# manual replacements
+# potatoes 1996 gets 43869000 lbs of fumigants
+# peanuts 2013 gets 1/3 of Fumigant, Fungicide, Growth Reg for 1303000 lbs
+# wheat 2015 gets 29000 lbs of 2015 divided as Fungicide 0.4, Growth Reg 0.2, Herbicide 0.4
+# for source data check "sleuthing_chemicals_others.R" in primitives folder
+# It's to make up for unaccounted chemical others
+additional_chem_other_data <- data.frame(
+  Year = c(1996, 2013, 2013, 2013, 2015, 2015, 2015),
+  Commodity = c("POTATOES", "PEANUTS", "PEANUTS", "PEANUTS", "WHEAT", "WHEAT", "WHEAT"),
+  type = c("Fumigant", "Fumigant", "Fungicide", "Growth Reg", "Fungicide", "Growth Reg", "Herbicide"),
+  Value = c(43869000, (0.33 * 1303000), (0.33 * 1303000), (0.33 * 1303000), 
+                (0.4 * 29000), (0.2 * 29000), (0.4 * 29000))
+)
+
+chemicals_after_1994_others_only_with_addition <- 
+  chemicals_after_1994_others_only %>% 
+  bind_rows(additional_chem_other_data) %>% 
+  arrange(Year, Commodity) %>% 
+  mutate(Domain = paste("CHEMICAL,", toupper(type))) %>% 
+  select(Year, Commodity, Domain, Value)
+
+# I now need to add chemicals_after_1994_others_only_with_addition to the >1994 dataset 
+# Also add the data before 1994 and the fertilizer data
+# and do one more sum by category, plus some cosmetics probably
+chem_processing <- 
+  chemicals_after_1994_totals_only %>% 
+  select(-c(`Data Item`, `Domain Category`)) %>% 
+  bind_rows(chemicals_after_1994_others_only_with_addition) %>% 
+  bind_rows(chemicals_before_1994) %>%
+  bind_rows(fertilizers_all_years) %>% 
+  ungroup() %>% 
+  group_by(Year, Commodity, Domain) %>% 
+  summarize(Value = sum(Value)) %>%
+  arrange(Year, Commodity)
+
+# select variables
+nass_chemicals_2 <- 
+  chem_processing %>% 
+  rename(crop = Commodity) %>% 
+  rename_all(tolower) %>% 
+  #separate(`data item`, c("crop", "item_orig"), sep = " - ") %>% 
+  #filter(item_orig == "APPLICATIONS, MEASURED IN LB") %>% 
+  mutate(#value = as.numeric(str_remove_all(value, ",")),
+         item = case_when(domain == "CHEMICAL, FUNGICIDE" ~ "chemical_fungicide",
+                          domain == "CHEMICAL, HERBICIDE" ~ "chemical_herbicide",
+                          domain == "CHEMICAL, INSECTICIDE" ~ "chemical_insecticide",
+                          domain == "CHEMICAL, FUMIGANT" ~ "chemical_fumigant",
+                          domain == "CHEMICAL, GROWTH REG" ~ "chemical_growth_reg",
+                          domain == "FERTILIZER: (NITROGEN)" ~ "fertilizer_nitrogen",
+                          domain == "FERTILIZER: (PHOSPHATE)" ~ "fertilizer_phosphate",
+                          domain == "FERTILIZER: (POTASH)" ~ "fertilizer_potash"
+                          )) %>% 
+  #filter(!is.na(item)) %>% 
+  mutate(crop = str_to_sentence(crop) %>% str_replace("_", ", "))
+
+# reshape & sum by major crop
+nass_chemicals_3 <- 
+  nass_chemicals_2 %>% 
+  select(year, crop, item, value) %>% 
+  spread(key = "item", value = "value") %>% 
+  mutate(crop = case_when(#crop == "Potatoes, fall" ~ "Potatoes",
+                          #crop == "Wheat, spring, (excl durum)" ~ "Wheat",
+                          #crop == "Wheat, spring, durum" ~ "Wheat",
+                          #crop == "Wheat, winter" ~ "Wheat",
+                          #crop == "Wheat, post harvest" ~ "Wheat", # only shows up in 2009 - delete?
+                          crop == "Sugarbeets" ~ "Sugar beets",
+                          TRUE ~ crop)) #%>% 
+  #group_by(year, crop) %>% 
+  #summarise_all(sum, na.rm = TRUE)
+
+# assume same chemical use rate for corn grain and corn silage
+corn_grain <- 
+  nass_chemicals_3 %>% 
+  filter(crop == "Corn") %>% 
+  mutate(crop = "Corn, grain")
+
+corn_silage <- 
+  nass_chemicals_3 %>% 
+  filter(crop == "Corn") %>% 
+  mutate(crop = "Corn, silage")
+
+corn <- 
+  bind_rows(corn_grain, corn_silage) %>% 
+  ungroup() %>% 
+  mutate(year = as.numeric(year)) %>% 
+  left_join(corn_pct, by = c("year", "crop")) %>% 
+  mutate_at(vars(-year, -crop), list(~ . * pct_corn_acres)) %>% 
+  select(-pct_corn_acres)
+
+nass_chemicals_4 <- 
+  nass_chemicals_3 %>% 
+  ungroup() %>% 
+  filter(crop != "Corn") %>% 
+  mutate(year = as.numeric(year)) %>% 
+  bind_rows(corn)
+
+nass_chemicals_final <- nass_chemicals_4
+
+#rm()
+```
+
+## 02 Clean FRIS Irrigation
+
+```{r clean_FRIS}
+# FRIS Irrigation
+# egc 03/17/2021
+
+# Here I am first adding data imputation methodology for the 2018 data, since it's missing non-irrigated yield and acreage
+# Calculate ratios for yield and acreage (non-irrigated / irrigated)
+ratio_test <- 
+  fris_irrigation %>% 
+  mutate(ratio_yield = yield_non_irrigated/yield_irrigated,
+         ratio_acreage = acres_non_irrigated/acres_irrigated)
+
+ratio_test %>% 
+  pull(year) %>% 
+  unique()
+
+ratio_last_four_samplings <- 
+  ratio_test %>% 
+  filter(year != 2018) %>% # 2018 is the sampling without non-irrigated data
+  arrange(crop, year) %>% 
+  group_by(crop) %>% 
+  slice(tail(row_number(), 4))
+
+ratio_avgs <- 
+  ratio_last_four_samplings %>% 
+  group_by(crop) %>% 
+  summarize(avg_yield_ratio = mean(ratio_yield, na.rm = T),
+            avg_acreage_ratio = mean(ratio_acreage, na.rm = T)) %>% 
+  ungroup() %>% 
+  mutate(year = 2018)
+
+fris_irrigation <- 
+  fris_irrigation %>% 
+  left_join(ratio_avgs, by = c("crop", "year")) %>% 
+  mutate(acres_non_irrigated = ifelse(test = year == 2018,
+                                      yes = acres_irrigated * avg_acreage_ratio,
+                                      no = acres_non_irrigated),
+         yield_non_irrigated = ifelse(test = year == 2018,
+                                      yes = yield_irrigated * avg_yield_ratio,
+                                      no = yield_non_irrigated)) %>% 
+  select(-c(avg_yield_ratio, avg_acreage_ratio)) %>% 
+  mutate(acres_non_irrigated = round(acres_non_irrigated, 0),
+         yield_non_irrigated = round(yield_non_irrigated, 0))
+
+# rename crops
+fris_irrigation_2 <- fris_irrigation %>% 
+  mutate(crop = str_to_sentence(crop),
+         crop = case_when(crop == "Sorghum, grain" ~ "Sorghum",
+                          crop == "Wheat, grain" ~ "Wheat",
+                          crop == "Barley, grain" ~ "Barley",
+                          crop == "Sugarbeets" ~ "Sugar beets",
+                          TRUE ~ crop)) %>% 
+  # Remove unused variable
+  select(-acre_wells_all_crops)
+
+# save final version
+fris_irrigation_final <- fris_irrigation_2
+```
+
+## 02 Clean CTIC CRM Tillage
+
+```{r clean_CRM_tillage}
+
+# CTIC - CRM Tillage
+# Soybeans and cotton are 0 for all data in 2002, this will permit to do interpolation by year/crop in the next step
+ctic_crm_tillage[ctic_crm_tillage == 0] <- NA
+
+# select & rename crops
+ctic_crm_tillage_2 <- ctic_crm_tillage %>% 
+  filter(crop %in% c("Corn", 
+                     "Soybeans (FS)",
+                     "Soybeans (DC)",
+                     "Cotton",
+                     "Spring Wheat",
+                     "Winter Wheat",
+                     "Grain Sorghum",
+                     "Grain Sorghum (FS)",
+                     "Barley",
+                     "Peanuts",
+                     "Potatoes",
+                     "Rice",
+                     "Sugar Beets",
+                     "Corn (FS)")) %>% 
+  group_by(crop) %>% 
+  arrange(year) %>% 
+  mutate_all(zoo::na.approx, na.rm = FALSE) %>% # egc added 03/19, interpolates soybeans and cotton missing 2002 survey
+  ungroup() %>% # egc added 03/19
+  mutate(crop = case_when(crop == "Soybeans (FS)" ~ "Soybeans", # Soybean acres includes FS (Full-season) and DC (double-crop)
+                          crop == "Soybeans (DC)" ~ "Soybeans", # Soybean acres includes FS (Full-season) and DC (double-crop)
+                          crop == "Spring Wheat" ~ "Wheat", # Wheat acres includes spring and winter wheat
+                          crop == "Winter Wheat" ~ "Wheat", # Wheat acres includes spring and winter wheat
+                          crop == "Grain Sorghum" ~ "Sorghum",
+                          crop == "Grain Sorghum (FS)" ~ "Sorghum",
+                          crop == "Sugar Beets" ~ "Sugar beets",
+                          crop == "Corn (FS)" ~ "Corn",
+                          TRUE ~ crop
+  )) %>% 
+  group_by(year, crop) %>% 
+  summarise_all(sum, na.rm = TRUE) %>% 
+  mutate_at(vars(-year, -crop, -total_acres), list(~ ./total_acres)) # calculate tillage type as pct of planted acres
+
+# rename variables
+ctic_crm_tillage_3 <- ctic_crm_tillage_2 %>% 
+  setNames(paste0('ctic_crm_', names(.))) %>% 
+  ungroup() %>% 
+  rename(year = ctic_crm_year,
+         crop = ctic_crm_crop,
+         ctic_crm_planted_acres = ctic_crm_total_acres)
+
+# assume same tillage pct for corn grain and corn silage
+corn_grain <- ctic_crm_tillage_3 %>% 
+  filter(crop == "Corn") %>% 
+  mutate(crop = "Corn, grain")
+
+corn_silage <- ctic_crm_tillage_3 %>% 
+  filter(crop == "Corn") %>% 
+  mutate(crop = "Corn, silage")
+
+corn <- bind_rows(corn_grain, corn_silage) %>% 
+  mutate(year = as.numeric(year)) %>% 
+  left_join(corn_pct, by = c("year", "crop")) %>% 
+  mutate(ctic_crm_planted_acres = ctic_crm_planted_acres * pct_corn_acres) %>% 
+  select(-pct_corn_acres)
+
+ctic_crm_tillage_4 <- ctic_crm_tillage_3 %>%
+  filter(crop != "Corn") %>% 
+  mutate(year = as.numeric(year)) %>% 
+  bind_rows(corn) %>% 
+  # egc 04/01 - summing up together reduced tillage, ridge till, mulch till
+  mutate(ctic_crm_reduced_till = ctic_crm_conservation_ridge_till + ctic_crm_conservation_mulch_till +
+           ctic_crm_reduced_till) %>% 
+  select(-c(ctic_crm_planted_acres, ctic_crm_conservation_ridge_till, ctic_crm_conservation_mulch_till, ctic_crm_conservation_till_total))
+
+# save final version
+ctic_crm_tillage_final <- ctic_crm_tillage_4
+```
+
+## 02 Clean CTIC OPTIS Data
+
+```{r clean_optis}
+# Placeholder here, not using the data so far
+# CTIC - OpTis Tillage
+### NEW DATA AVAILABLE, NEED TO REVISE ###
+# egc note 03/19, these data are only corn/soybeans for the I states...
+# Not for National Indicators Report - egc 04/06/2021
+#ctic_optis_tillage$crop %>% unique()
+
+# select crops
+#ctic_optis_tillage_2 <- ctic_optis_tillage %>% 
+#  filter(crop %in% c("Corn", "Soybeans"))
+
+# save final version
+# ctic_optis_tillage_final <- ctic_optis_tillage_2
+```
+
+## 02 Clean ARMS Tillage
+
+```{r clean_ARMS_tillage}
+# ARMS Tillage
+# select & rename final crops
+arms_tillage_2 <- arms_tillage %>% 
+  filter(crop %in% c("Corn", 
+                     "Soybeans",
+                     "Cotton",
+                     "Spring Wheat",
+                     "Winter Wheat",
+                     "Durum Wheat",
+                     "Barley",
+                     "Peanuts",
+                     "Rice")) %>% 
+  mutate(crop = case_when(crop == "Spring Wheat" ~ "Wheat", # Wheat acres includes spring, winter, and durum wheat
+                          crop == "Winter Wheat" ~ "Wheat", # Wheat acres includes spring, winter, and durum wheat
+                          crop == "Durum Wheat" ~ "Wheat",  # Wheat acres includes spring, winter, and durum wheat
+                          TRUE ~ crop
+  )) %>% 
+  group_by(year, crop) %>% 
+  summarise_all(sum, na.rm = TRUE) %>% 
+  mutate_at(vars(-year, -crop, -total_acres), list(~ ./total_acres)) %>% # tillage type as pct of planted acres
+  # egc 04/01/2021 aggregating for reduced till and removing unnecessary variables
+  mutate(reduced_till = ridge_till + mulch_till + reduced_till) %>%
+  select(-c(mulch_till, ridge_till, unknown_till))
+
+# rename variables
+arms_tillage_3 <- arms_tillage_2 %>% 
+  setNames(paste0('arms_', names(.))) %>% 
+  ungroup() %>% 
+  rename(year = arms_year,
+         crop = arms_crop,
+         arms_planted_acres = arms_total_acres)
+
+# assume same tillage pct for corn grain and corn silage
+corn_grain <- arms_tillage_3 %>% 
+  filter(crop == "Corn") %>% 
+  mutate(crop = "Corn, grain")
+
+corn_silage <- arms_tillage_3 %>% 
+  filter(crop == "Corn") %>% 
+  mutate(crop = "Corn, silage")
+
+corn <- bind_rows(corn_grain, corn_silage) %>% 
+  mutate(year = as.numeric(year)) %>% 
+  left_join(corn_pct, by = c("year", "crop")) %>% 
+  mutate(arms_planted_acres = arms_planted_acres * pct_corn_acres) %>% 
+  select(-pct_corn_acres)
+
+arms_tillage_4 <- arms_tillage_3 %>% 
+  filter(crop != "Corn") %>% 
+  mutate(year = as.numeric(year)) %>% 
+  bind_rows(corn) %>% 
+  select(-arms_planted_acres)
+
+arms_tillage_4[arms_tillage_4 == 0] <- NA
+
+# save final version
+arms_tillage_final <- arms_tillage_4
+```
+
+## 02 Clean ARMS Manure
+
+```{r clean_ARMS_manure}
+
+# ARMS Manure
+
+# select variables
+arms_manure_2 <- arms_manure %>% 
+  rename(item = `...1`, unit = `...2`) %>% 
+  filter(item %in% c("Planted acres", "Treated with manure", "Tons Applied")) %>%
+  gather(key = "year", value = "value", -crop, -item, -unit)
+
+# rename variables & reshape dataset
+arms_manure_3 <- arms_manure_2 %>% 
+  select(-unit) %>% 
+  mutate(value = str_remove(value, "\\*"),
+         value = as.numeric(value)) %>%  
+  spread(key = "item", value = "value") %>% 
+  rename(manure_planted_acres = `Planted acres`,
+         manure_pct_treated = `Treated with manure`,
+         manure_tons_per_acre = `Tons Applied`) %>% 
+  filter_at(vars(-crop, -year), any_vars(!is.na(.))) %>% 
+  mutate(crop = str_to_sentence(crop))
+
+# Renaming crops, we can add values for categories of barley (malt vs. feed) and wheat (spring, winter, and durum)
+# and get an overall value for barley and wheat
+# What we need:
+# Manure tons per acre
+# Share of acreage treated with manure
+# Nitrogen content from that manure app (assumed value)
+
+arms_manure_4 <- arms_manure_3 %>% 
+  # Combining types for barley and wheat
+  mutate(crop = case_when(crop == "Barley_feed" ~ "Barley",
+                          crop == "Barley_malt" ~ "Barley",
+                          crop == "Durum_wheat" ~ "Wheat",
+                          crop == "Spring_wheat" ~ "Wheat",
+                          crop == "Winter_wheat" ~ "Wheat",
+                          TRUE ~ crop)) %>% 
+  group_by(year, crop) %>% 
+  # Here we aggregate the barley and wheat values
+  summarize(manure_planted_acres = sum(manure_planted_acres, na.rm = TRUE),
+            manure_tons_per_acre = mean(manure_tons_per_acre, na.rm = TRUE),
+            manure_pct_treated = mean(manure_pct_treated, na.rm = TRUE))
+
+# Documenting how we calculate the manure nitrogen content
+# weighting based on ARMS corn 2010 manure table data, not perfect but couldn't find national info on this
+# source of nutrient content http://omafra.gov.on.ca/english/crops/facts/13-043.htm
+manure_nitrogen_content <- data.frame(
+  animal = c("beef", "dairy", "pork", "poultry"),
+  n_pct = c(0.37, 0.39, 0.39, 0.81),
+  weight = c(0.22, 0.42, 0.24, 0.12)) %>% 
+  mutate(value = n_pct * weight) %>% 
+  summarize(weighted_average = sum(value/100)) %>% 
+  pull(weighted_average)
+
+# Here we calculate the rate for all acreage and the N lb/acre from manure
+arms_manure_5 <- arms_manure_4 %>%
+  mutate(year = as.numeric(year)) %>% 
+  bind_rows(ers_manure_corn_data) %>% # bringing the new corn grain/silage data from ERS
+  mutate(manure_planted_acres = manure_planted_acres * 1000, # to get acreage in millions
+    manure_total_tons = manure_tons_per_acre * (manure_planted_acres * (manure_pct_treated / 100)),
+    manure_rate_all_acreage = manure_total_tons / manure_planted_acres, # effective manure rate
+    manure_N_lbs_per_acre = manure_rate_all_acreage * 2000 * manure_nitrogen_content) # 2000 to convert ton to lb
+
+# Empty data points
+arms_manure_5[arms_manure_5 == "NaN"] <- NA
+
+arms_manure_6 <- arms_manure_5 %>% 
+  filter(!is.na(manure_tons_per_acre))
+
+# Duplicating data for corn grain and silage
+# assume same tillage pct for corn grain and corn silage
+# corn_grain <- arms_manure_6 %>% 
+#   filter(crop == "Corn") %>% 
+#   mutate(crop = "Corn, grain")
+# 
+# corn_silage <- arms_manure_6 %>% 
+#   filter(crop == "Corn") %>% 
+#   mutate(crop = "Corn, silage")
+# 
+# corn <- bind_rows(corn_grain, corn_silage) %>% 
+#   ungroup()
+  # If we know of a better method to adjust corn grain and silage, it should be done below
+  #mutate(year = as.numeric(year)) %>% 
+  #left_join(corn_pct, by = c("year", "crop")) %>% 
+  #mutate(
+  #       manure_total_tons = manure_total_tons * pct_corn_acres) %>% 
+  # mutate(manure_planted_acres = manure_planted_acres * pct_corn_acres,
+  #        manure_total_tons = manure_tons_per_acre * (manure_planted_acres * (manure_pct_treated / 100)),
+  #        manure_rate_all_acreage = manure_total_tons / manure_planted_acres,
+  #        manure_N_lbs_per_acre = manure_rate_all_acreage * 2000 * 0.75/100) %>% 
+  # select(-pct_corn_acres)
+
+arms_manure_7 <- arms_manure_6 %>% 
+  ungroup() %>% 
+  filter(crop != "Corn") %>% 
+  # bringing the corn grain and silage data
+  #bind_rows(corn) %>%
+  # selecting only variables of interest
+  select(1:2, 7:8)
+
+# save final version
+arms_manure_final <- arms_manure_7 %>% 
+  arrange(year, crop)
+
+# The code below is primitive - egc 04/08/2021
+# ARMS Manure
+# 
+# # select variables
+# arms_manure_2 <- arms_manure %>% 
+#   rename(item = `...1`, unit = `...2`) %>% 
+#   filter(item %in% c("Planted acres", "Treated with manure", "Tons Applied") |
+#          unit %in% c("Manure State Pct of Treated Acres", "Manure Type Pct of Treated Acres")) %>% 
+#   gather(key = "year", value = "value", -crop, -item, -unit)
+# 
+# # rename variables & reshape dataset
+# arms_manure_3 <- arms_manure_2 %>% 
+#   select(-unit) %>% 
+#   mutate(value = str_remove(value, "\\*"),
+#          value = as.numeric(value)) %>%  
+#   spread(key = "item", value = "value") %>% 
+#   rename(manure_planted_acres = `Planted acres`,
+#          manure_pct_treated = `Treated with manure`,
+#          manure_tons_per_acre = `Tons Applied`,
+#          manure_beef = `Beef cattle`,
+#          manure_dairy = `Dairy cattle`,
+#          manure_hog = `Hogs`,
+#          manure_poultry = `Poultry`,
+#          manure_other = `Other`,
+#          manure_slurry = `Slurry Liquid`,
+#          manure_dry = `Semi-dry or Dry`,
+#          manure_lagoon = `Lagoon liquid`) %>% 
+#   filter_at(vars(-crop, -year), any_vars(!is.na(.))) %>% 
+#   mutate(crop = str_to_sentence(crop))
+# 
+# # calculate tons of manure applied by type and state
+# # based on share of manure applied by type and state
+# # this way we can add up values for sub-categories of barley (malt vs. feed) and wheat (spring, winter, and durum)
+# # and get an overall value for barley and wheat
+# 
+# arms_manure_4 <- arms_manure_3 %>% 
+#   mutate(manure_total_tons = manure_tons_per_acre * (manure_planted_acres * manure_pct_treated / 100)) %>% 
+#   mutate_at(vars(manure_beef, manure_dairy, manure_hog, manure_poultry, manure_other,
+#                  manure_slurry, manure_dry, manure_lagoon), # calculate manure type as pct of total manure
+#             list(~ manure_total_tons * ./100)) %>% 
+#   mutate(crop = case_when(crop == "Barley_feed" ~ "Barley",
+#                           crop == "Barley_malt" ~ "Barley",
+#                           crop == "Durum_wheat" ~ "Wheat",
+#                           crop == "Spring_wheat" ~ "Wheat",
+#                           crop == "Winter_wheat" ~ "Wheat",
+#                           TRUE ~ crop)) %>% 
+#   group_by(year, crop) %>% 
+#   summarise_at(vars(-manure_pct_treated, -manure_tons_per_acre), sum, na.rm = TRUE) %>% 
+#   filter(manure_total_tons > 0) %>% 
+#   mutate_at(vars(manure_beef, manure_dairy, manure_hog, manure_poultry, manure_other,
+#                  manure_slurry, manure_dry, manure_lagoon), 
+#             list(~ ./manure_total_tons)) %>% 
+#   select(year, crop,
+#          manure_planted_acres, manure_total_tons,
+#          manure_beef, manure_dairy, manure_hog, manure_poultry, manure_other,
+#          manure_slurry, manure_dry, manure_lagoon)
+# 
+# # check planted acres against NASS results - adjust manure amt if needed
+# # manure type/state percentages don't always add up to 1 due to data availability in ARMS
+# 
+# # assume same tillage pct for corn grain and corn silage
+# corn_grain <- arms_manure_4 %>% 
+#   filter(crop == "Corn") %>% 
+#   mutate(crop = "Corn, grain")
+# 
+# corn_silage <- arms_manure_4 %>% 
+#   filter(crop == "Corn") %>% 
+#   mutate(crop = "Corn, silage")
+# 
+# corn <- bind_rows(corn_grain, corn_silage) %>% 
+#   ungroup() %>% 
+#   mutate(year = as.numeric(year)) %>% 
+#   left_join(corn_pct, by = c("year", "crop")) %>% 
+#   mutate(manure_planted_acres = manure_planted_acres * pct_corn_acres,
+#          manure_total_tons = manure_total_tons * pct_corn_acres) %>% 
+#   select(-pct_corn_acres)
+# 
+# arms_manure_5 <- arms_manure_4 %>% 
+#   ungroup() %>% 
+#   filter(crop != "Corn") %>% 
+#   mutate(year = as.numeric(year)) %>% 
+#   bind_rows(corn) %>% 
+#   # egc 04/01/2021 selecting only variables of interest
+#   select(1:2, 4)
+# 
+# # save final version
+# arms_manure_final <- arms_manure_5
+```
+
+## 02 Clean ERS Tillage Intensity - deprecated 05/14/2021
+
+```{r ers_tillage}
+
+# deprecated egc 05/14/2021
+# Processing
+# ers_tillage_2 <- ers_tillage %>% 
+#   # Removing footnotes
+#   filter(!is.na(`Tillage practice`)) %>% 
+#   # Separating crop year variable
+#   separate(col = `Crop/year`, into = c("crop", "year"), sep = ", ") %>% 
+#   # Remove unknown tillage
+#   filter(!`Tillage practice` == "Not determined") %>% 
+#   # Remove standard error variable
+#   select(-`Relative standard error (percent)`) %>% 
+#   # Recoding tillage categories
+#   mutate(`Tillage practice` = case_when(`Tillage practice` == "Conventional" ~ "ers_conventional_till",
+#                           `Tillage practice` == "Mulch till" ~ "ers_reduced_till",
+#                           `Tillage practice` == "No-till" ~ "ers_no_till",
+#                           TRUE ~ `Tillage practice`)) %>% 
+#   # Dividing value by 100 to get percent share
+#   mutate(`Estimate (percent of planted acres)` = `Estimate (percent of planted acres)`/100) %>% 
+#   # Spreading variables to conform with format
+#   spread(`Tillage practice`, `Estimate (percent of planted acres)`)
+# 
+# # Duplicating corn into corn grain, corn silage
+# # assume same tillage pct for corn grain and corn silage
+# corn_grain <- ers_tillage_2 %>% 
+#   filter(crop == "Corn") %>% 
+#   mutate(crop = "Corn, grain")
+# 
+# corn_silage <- ers_tillage_2 %>% 
+#   filter(crop == "Corn") %>% 
+#   mutate(crop = "Corn, silage")
+# 
+# corn <- bind_rows(corn_grain, corn_silage) %>% 
+#   ungroup() %>% 
+#   mutate(year = as.numeric(year))
+# 
+# ers_tillage_3 <- ers_tillage_2 %>% 
+#   ungroup() %>% 
+#   filter(crop != "Corn") %>% 
+#   mutate(year = as.numeric(year)) %>% 
+#   bind_rows(corn) %>% 
+#   arrange(year, crop)
+# 
+# ers_tillage_final <- ers_tillage_3
+```
+
+## 02 Cleaning new ERS tillage 2021 data
+
+```{r ers_2021}
+
+ers_tillage_2021_2 <- ers_tillage_2021 %>% 
+  select(Crop, `Survey Year`, `Conventional Till, estimate (percent of planted acres)`,
+         `Mulch till, estimate (percent of planted acres)`, `No-till, estimate (percent of planted acres)`) %>% 
+  rename(crop = Crop,
+         year = `Survey Year`,
+         conventional_share_2021 = `Conventional Till, estimate (percent of planted acres)`,
+         reduced_share_2021 = `Mulch till, estimate (percent of planted acres)`,
+         no_till_share_2021 = `No-till, estimate (percent of planted acres)`) %>% 
+  mutate(conventional_share_2021 = conventional_share_2021/100,
+         reduced_share_2021 = reduced_share_2021/100,
+         no_till_share_2021 = no_till_share_2021/100) %>% 
+  filter(crop != "Oats") %>% 
+  mutate(crop = ifelse(crop == "Corn",
+                       "Corn, grain",
+                       crop))
+
+ers_2021_corn_silage <- ers_tillage_2021_2 %>% 
+  filter(crop == "Corn, grain") %>% 
+  mutate(crop = "Corn, silage")
+
+ers_tillage_2021_3 <- ers_tillage_2021_2 %>% 
+  bind_rows(ers_2021_corn_silage) %>% 
+  arrange(crop, year)
+
+ers_tillage_2021_final <- ers_tillage_2021_3
+```
+
+## 02 Aggregating tillage sources
+
+We have three data sources for tillage. This aggregates by crop, year when data points overlap. The latest data from ERS obtained around 05/05/2021 supercedes the previous tillage intensity data ers_tillage_final
+
+```{r avg_till_shares}
+
+# arms_tillage_final %>% nrow()
+# ctic_crm_tillage_final %>% nrow()
+# ers_tillage_final %>% nrow() - deprecated egc 05/14/2021
+# ers_tillage_2021_final %>% nrow()
+
+all_tillage <- ctic_crm_tillage_final %>% 
+  # Join all sources
+  full_join(arms_tillage_final) %>% 
+  #full_join(ers_tillage_final) %>% # deprecated egc 05/14/2021
+  full_join(ers_tillage_2021_final) %>% 
+  # Gather data to facilitate grouping and summarizing
+  gather(key, value, -c(crop, year)) %>% 
+  # Add common tillage categories
+  mutate(till_type = ifelse(test = key %in% c("ctic_crm_conventional_till", "arms_conventional_till",
+                                              "conventional_share_2021"),
+                            yes = "conventional_till_share",
+                            no = ifelse(test = key %in% c("ctic_crm_reduced_till", "arms_reduced_till",
+                                                          "reduced_share_2021"),
+                                        yes = "reduced_till_share",
+                                        no = "no_till_share"))) %>%
+  ungroup() %>% 
+  # Keeping out ARMS soybeans 2012 data because it seems off
+  filter(!(year == 2012 & crop == "Soybeans" & key %in% c("arms_no_till", "arms_reduced_till"))) %>%
+  # Keeping out ARMS rice and peanuts 2013 data because it seems off
+  filter(!(year == 2013 & crop %in% c("Rice", "Peanuts") & key %in% c("arms_no_till", "arms_reduced_till"))) %>% 
+  group_by(year, crop, till_type) %>% 
+  # Calculate average share
+  summarize(mean_share = mean(value, na.rm = TRUE)) %>% 
+  # Spread again to meet formatting standards
+  spread(key = till_type, value = mean_share) %>% 
+  ungroup()
+
+# Some NaNs around due to an entire category of tillage type missing for peanuts and rice, not an error
+all_tillage[all_tillage == "NaN"] <- 0
+
+# The addition of tillage shares is close to 1 for all crops. Some underestimation will occur
+#View(all_tillage %>% mutate(addition_to_what = conventional_till_share + reduced_till_share + no_till_share))
+
+```
+
+## 02 Cleaning ERS Seed data
+
+```{r seed_data}
+
+# Data manually downloaded from https://data.ers.usda.gov/reports.aspx?ID=17883
+# Report: Seed Use
+ers_seed_data_2 <- ers_seed_data %>% 
+  # Filter for seeding rate only
+  filter(type == "Average seeding rate") %>% 
+  # Gather the data frame
+  gather(key = year, value, -c(1:3)) %>% 
+  # Make year and value numeric
+  mutate(value = as.numeric(value),
+         year = as.numeric(year)) %>% 
+  # Remove NA values
+  filter(!is.na(value)) %>% 
+  select(year, crop, type, units, value) %>% 
+  mutate(value2 = ifelse(crop %in% c("Corn, grain", "Corn, silage") & year < 2002,
+                         value / 1607, # approx 90,0000 seeds divided by 56 lbs https://crops.extension.iastate.edu/cropnews/2017/08/estimating-corn-yields-using-yield-components
+                         value)) %>% 
+  # There is an error for sorghum. We'll substitute the wrong value for the previous value in the survey
+  mutate(value2 = ifelse(test = crop == "Sorghum" & year == 2003,
+                         yes = 5.38,
+                         no = value2)) %>% 
+  # Remove value, type and units
+  select(-c(type, units, value)) %>% 
+  # Rename value2
+  rename(seeding_rate_lbs_per_acre = value2)
+
+# Updated seed use data for four major crops from Laura Dodson, REE-ERS, Washington, DC
+# Laura sent updated numbers for a few crops. See file "Seeding Rates for OPM.xlsx"
+# These data are not published online as of April 06 2021
+latest_ers_seed_use <- read_csv("raw_data/ers_seed_data/latest_seed_use_from_ERS.csv")
+
+# Appending the updated data with what was manually downloaded
+ers_seed_data_3 <- ers_seed_data_2 %>% 
+  bind_rows(latest_ers_seed_use) %>% 
+  arrange(year, crop) %>% 
+  # Summarizing when we have more than 1 crop category for the same crop, Barley and Wheat
+  mutate(crop2 = case_when(crop == "Barley, feed" ~ "Barley",
+                          crop == "Barley, malt" ~ "Barley",
+                          crop == "Wheat, durum" ~ "Wheat",
+                          crop == "Wheat, spring" ~ "Wheat",
+                          crop == "Wheat, winter" ~ "Wheat",
+                          TRUE ~ crop)) %>% 
+  group_by(year, crop2) %>% 
+  summarize(seeding_rate_lbs_per_acre = mean(seeding_rate_lbs_per_acre)) %>% 
+  rename(crop = crop2) %>% 
+  ungroup()
+
+ers_seed_data_final <- ers_seed_data_3
+
+```
+
+## 02 Cleaning NRI Erosion Data
+
+```{r nri_cleaning}
+
+NRI_soil_erosion_1 <- 
+  NRI_soil_erosion %>% 
+  mutate(year = as.numeric(year)) %>%
+  select(year, crop, erosion_rate) %>% 
+  filter(!crop == "Crops") %>% 
+  mutate(crop2 = case_when(crop == "Beets" ~ "Sugar beets",
+                          TRUE ~ crop)) %>% 
+  select(-crop) %>% 
+  rename(crop = crop2)
+
+# Duplicating corn into corn grain, corn silage
+# assume same tillage pct for corn grain and corn silage
+corn_grain <- NRI_soil_erosion_1 %>% 
+  filter(crop == "Corn") %>% 
+  mutate(crop = "Corn, grain")
+
+corn_silage <- NRI_soil_erosion_1 %>% 
+  filter(crop == "Corn") %>% 
+  mutate(crop = "Corn, silage")
+
+corn <- bind_rows(corn_grain, corn_silage) %>% 
+  ungroup()
+
+NRI_soil_erosion_final <- NRI_soil_erosion_1 %>% 
+  ungroup() %>% 
+  filter(crop != "Corn") %>% 
+  bind_rows(corn) %>%
+  select(year, crop, erosion_rate) %>% 
+  arrange(year, crop) %>% 
+  rename(erosion_rate_tons_acre = erosion_rate)
+
+rm(corn_grain, corn_silage, corn)
+```
+
+## 02 Clean rice methane emissions
+
+```{r rice_methane}
+
+# Processing
+rice_methane_emissions_2 <- rice_methane_emissions %>% 
+  # Converting Million Metric Tons of CO2e to pounds, all mass conversions
+  mutate(CO2e_total_lbs = MMT_CO2e * 1000000 * 2204.62,
+         # Thousand hectares to acres
+         harvested_acreage = (harvested_ha_thousands * 1000) / 0.404686,
+         # Calculating methane emissions per harvested acre. Side note, the harvested acreage doesn't match NASS data
+         # Stephen Ogle said they use National Resources Inventory data rather than NASS data, personal comm
+         methane_CO2e_acre = round(CO2e_total_lbs / harvested_acreage, 1)
+         ) %>% 
+  select(year, crop, methane_CO2e_acre)
+
+rice_methane_final <- rice_methane_emissions_2
+```
+
+## 02 Clean eGRID efficiency data
+
+```{r eGRID}
+
+# Removing data source
+egrid_efficiency_2 <- egrid_efficiency %>% 
+  select(-source)
+
+# Quadratic model provides a better fit to fill data back to 1980
+quad_mld <- lm(lb_CO2_MWh ~ year + I(year^2), data = egrid_efficiency)
+
+# Creating dataset to add predictions
+explanatory_data <- data.frame(
+  year = 1980:2020
+)
+
+predicted_efficiency <- explanatory_data %>% 
+  mutate(lb_CO2_MWh = predict(quad_mld, explanatory_data))
+
+# highest curve number to use as replacement because the quad function dips
+max(predicted_efficiency$lb_CO2_MWh)
+
+# pulling index value lb_CO2_MWh for a specific year for ratio calculation
+efficiency_index_value <- predicted_efficiency %>% 
+  filter(year == 2014) %>% # what year should we choose? 2009 for pesticides? 2014 for fertilizers? for irrigation the latest year? Pulling 2014 because metric updates were done with GREET 2014 model
+  pull(lb_CO2_MWh) %>% 
+  unname()
+
+eGRID_efficiency_final <- predicted_efficiency %>% 
+  # Replacing data before 1992
+  mutate(lb_CO2_MWh = ifelse(year < 1992, # the year the curve drops going back to 1980
+                             max(predicted_efficiency$lb_CO2_MWh),
+                             lb_CO2_MWh)) %>% 
+  # Calculating efficiency ratio, this will be used to multiply the emissions for irrigation, pesticides, fertilizers, maybe potato storage
+  mutate(egrid_efficiency_ratio = lb_CO2_MWh / efficiency_index_value) %>% 
+  select(-lb_CO2_MWh)
+
+```
+
+## Cleaning application data (number of passes)
+
+```{r num_passes}
+
+nass_num_passes_2 <- nass_num_passes %>%
+  select(year, commodity_desc, domain_desc, domaincat_desc, Value) %>% 
+  mutate(Value = as.numeric(Value)) %>% 
+  filter(!is.na(Value)) %>% 
+  filter(domain_desc %in% c("CHEMICAL, FUNGICIDE", "CHEMICAL, HERBICIDE", "CHEMICAL, INSECTICIDE",
+                            "CHEMICAL, OTHER", "FERTILIZER")) %>% 
+  filter(domaincat_desc != "FERTILIZER: (SULFUR)") %>% 
+  group_by(year, commodity_desc, domain_desc) %>% 
+  top_n(5, Value) %>% # for each category, we keep the top 5 values due to large number of 1-application chemicals
+  ungroup() %>% 
+  mutate(commodity_desc = str_to_sentence(commodity_desc),
+         commodity_desc = case_when(commodity_desc == "Potatoes, fall" ~ "Potatoes",
+                          commodity_desc == "Wheat, spring, (excl durum)" ~ "Wheat",
+                          commodity_desc == "Wheat, spring, durum" ~ "Wheat",
+                          commodity_desc == "Wheat, winter" ~ "Wheat",
+                          commodity_desc == "Sugarbeets" ~ "Sugar beets",
+                          TRUE ~ commodity_desc),
+         # Creating the proper categories for aggregating, not that easy
+         domaincat_desc = ifelse(str_detect(domaincat_desc, "CHEMICAL"),
+                                      domain_desc,
+                                      domaincat_desc),
+         domaincat_desc = ifelse(str_detect(domaincat_desc, "PHOSPHATE|POTASH"), # combine P and K
+                                 "P + K",
+                                 domaincat_desc))
+
+nass_num_passes_3 <- nass_num_passes_2 %>% 
+  group_by(year, commodity_desc, domaincat_desc) %>% 
+  summarize(avg_applications = mean(Value),
+            n = n()) %>% 
+  group_by(year, commodity_desc) %>% 
+  summarize(total_application_passes = sum(avg_applications)) %>% 
+  ungroup()
+
+passes_corn_grain <- nass_num_passes_3 %>% 
+  filter(commodity_desc == "Corn") %>% 
+  mutate(commodity_desc = "Corn, grain")
+
+passes_corn_silage <- nass_num_passes_3 %>% 
+  filter(commodity_desc == "Corn") %>% 
+  mutate(commodity_desc = "Corn, silage")
+
+corn_bind <- passes_corn_grain %>% 
+  bind_rows(passes_corn_silage)
+
+nass_num_passes_4 <- nass_num_passes_3 %>% 
+  filter(commodity_desc != "Corn") %>% 
+  bind_rows(corn_bind) %>% 
+  arrange(year, commodity_desc) %>% 
+  rename(crop = commodity_desc) %>% 
+  mutate(total_application_passes = round(total_application_passes/1.5, 1),
+         year = as.numeric(year))
+
+nass_num_passes_final <- nass_num_passes_4
+
+# The method is as follows: The top 5 applications are kept. This is only for the chemical categories, which has a large number of 1-application active ingredients that are diluting the averages. Chemical categories contribute an average each, P + K contributes an average of P an K, Nitrogen contributes all of its contents, then all applications are summed up. Initially, I am assuming that no crop protectant applications are combined, that P and K applications are combined, and that N applications are not combined either. Then I divide the final number by 1.5 to account for a measure of applications that are typically combined.
+
+```
+
+## Cleaning nitrogen production efficiency
+
+```{r n_efficiency}
+# pulling index value for the last year
+N_production_efficiency_index_value <- N_production_efficiency %>% 
+  filter(year == 2020) %>%
+  pull(value) %>% 
+  unname()
+
+IFA_NH3_efficiency_final <- N_production_efficiency %>% 
+  # Calculating efficiency ratio, this will be used to multiply the energy for nitrogen
+  mutate(IFA_efficiency_multiplier = value / N_production_efficiency_index_value) %>% 
+  select(-value)
+```
+
+## Cleaning global CO2 intensity
+
+```{r globalCO2intensity}
+
+global_CO2_index <- global_CO2_intensity %>% 
+  tail(n = 1) %>% 
+  pull(value)
+
+global_CO2_intensity_final <- global_CO2_intensity %>% 
+  mutate(CO2_intensity_multiplier = value / global_CO2_index) %>% 
+  select(-value)
+
+```
+
+## Cleaning global energy intensity
+
+```{r global_energy}
+global_energy_intensity_final <- global_energy_intensity
+```
+
+## Cleaning irrigation power source share
+```{r irri_power}
+
+# Creating blank data frame to receive the data
+irrigation_power_trend <- data.frame(
+  year = 1979:2019
+  ) %>% 
+  left_join(fris_irrigation_power_source)
+
+# Imputing the 2018 data to 2020 to fill in
+data_2020 <- irrigation_power_trend %>% 
+  filter(year == 2018) %>% 
+  mutate(year = 2020)
+
+irrigation_power_trend_final <- irrigation_power_trend %>% 
+  bind_rows(data_2020) %>% 
+  mutate_all(zoo::na.approx, na.rm = F) %>% 
+  filter(year != 1979)
+```
+## 02 Save Output 02
+
+```{r saving_output_02}
+# Join & Save
+
+indicators_input <- nass_land_use_final %>% 
+  left_join(fris_irrigation_final) %>% 
+  #left_join(ctic_crm_tillage_final) %>% # replaced with all_tillage
+  # left_join(ctic_optis_tillage_final) %>% # egc note 03/17 - Kathy excluded CTIC Optis data
+  left_join(arms_manure_final) %>% 
+  #left_join(arms_tillage_final) %>% # replaced with all_tillage
+  left_join(nass_chemicals_final) %>% 
+  #left_join(ers_tillage_final)# replaced with all_tillage
+  left_join(all_tillage) %>% 
+  left_join(ers_seed_data_final) %>% 
+  left_join(NRI_soil_erosion_final) %>%
+  left_join(area_burned) %>%
+  left_join(rice_methane_final) %>% 
+  left_join(eGRID_efficiency_final) %>% 
+  left_join(removal_residue) %>% 
+  left_join(nass_num_passes_final) %>%
+  left_join(IFA_NH3_efficiency_final) %>% 
+  left_join(global_CO2_intensity_final) %>% 
+  left_join(global_energy_intensity_final) %>%
+  left_join(irrigation_power_trend_final) %>% 
+  filter(!year == 2021) %>% # removing 2021 data which is starting to show up with the USDA API Queries
+  # Here I should do the sugar beets sucrose adjustment
+  # I am joining the sugar beets sucrose pct here, doing the yield adjustment for sucrose, and removing the variable
+  # Pct sucrose is not given at national level by NASS, so I averaged all available data by year
+  # This way, sugar beets is expressed in tons sugar/acre, rather than raw tons
+  left_join(sugarbeets_sucrose_pct_2) %>%
+  fill(sucrose_pct, .direction = "down") %>% # data imputation for 2019-2020
+  mutate(yield = ifelse(crop == "Sugar beets",
+                        yield * (sucrose_pct/100),
+                        yield),
+         production = ifelse(crop == "Sugar beets",
+                        production * (sucrose_pct/100),
+                        production),
+         yield_irrigated = ifelse(crop == "Sugar beets",
+                        yield_irrigated * (sucrose_pct/100),
+                        yield_irrigated),
+         yield_non_irrigated = ifelse(crop == "Sugar beets",
+                        yield_non_irrigated * (sucrose_pct/100),
+                        yield_non_irrigated)) %>% 
+  mutate(yield = round(yield, 1),
+         production = round(production, 1),
+         yield_irrigated = round(yield_irrigated, 1),
+         yield_non_irrigated = round(yield_non_irrigated, 1),) %>% 
+  select(-sucrose_pct)
+
+save(indicators_input, file = "r_data/outputs_02_egc.rda")
+
+# a quality check View(indicators_input %>% count(crop))
+```

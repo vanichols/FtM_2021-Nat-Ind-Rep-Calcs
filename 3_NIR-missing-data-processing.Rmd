@@ -1,0 +1,259 @@
+---
+title: "NIR Processing"
+author: "Eric Coronel and Gina Nichols"
+date: "3/25/2021, looked at 6/17/2022-gn"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+# R Packages And Other Global Options
+
+library(tidyverse)
+library(readxl)
+library(usdarnass)
+library(zoo)
+
+nass_set_key("40DCDA93-B5E8-33FB-B96F-47902CD5E5A0") # for NASS API queries
+options(scipen = 999)
+
+# Custom Functions
+
+coronel_qc <- function(data, batch_name = "_regular") {
+  
+  vector_names <- names(data) %>% 
+    tail(n = length(names(data)) - 2)
+  
+  for (i in 1:length(vector_names)) {
+    graph01 <- ggplot(data, aes(x = year, y = get(vector_names[i]), group = crop)) +
+      geom_line() +
+      geom_point() +
+      labs(title = paste(vector_names[i]), y = paste(vector_names[i])) +
+      facet_wrap(~ crop, scales = "free") +
+      geom_blank(aes(y = 0))
+    
+    print(paste(vector_names[i], "-", i, "out of", length(vector_names)))
+    ggsave(plot = graph01, filename = paste0("temp_qc_output/", str_pad(i, 2, pad = "0"), "_", vector_names[i],
+                                             batch_name, ".png"))
+  }
+}
+
+coronel_one_off_graph <- function(data, x, y) {
+  ggplot(data, aes(get(x), get(y))) +
+  geom_point() +
+  facet_wrap(~ crop, scales = "free") +
+      geom_blank(aes(y = 0))
+}
+
+coronel_loess <- function(data, x, y) {
+  ggplot(data, aes(get(x), get(y), group = crop)) +
+  geom_point() +
+  geom_line() +
+  geom_smooth(method = "loess", se = F) +
+  facet_wrap(~ crop, scales = "free") +
+      geom_blank(aes(y = 0))
+}
+
+```
+
+
+# 03 Fill-in Missing Data
+
+## 03 Load Data If Needed
+```{r load_outputs_02_egc}
+# Load data from previous step
+
+load("r_data/outputs_02_egc.rda")
+
+input <- indicators_input
+```
+
+## 03 Calculate New Yield Variables
+
+```{r new_yield}
+# Average yield
+# re-calculate yield per acre planted and yield per acre harvested
+input_2 <- 
+  input %>% 
+  mutate(yield_planted = production/acres_planted,
+         yield_harvested = production/acres_harvested)
+```
+
+## 03 Seeding rates for potatoes, sugar beets and other fixes
+
+```{r seed_rates_fixes}
+
+# Research from report titled Acres Planted per Day and Seeding Rates of Crops Grown in the United States, EPA 2010
+# Potatoes in page 36
+# Sugar beets in page 41. I won't use the undated sources. Let's use the rate of 55,000 seeds/acre or 5.5 lb/acre when divided by 10,000 seeds per acre, from the Colorado USDA reference in 2003
+# 10,000 seeds/lb for sugar beets https://antlerking.com/product/antler-king-brand-sugar-beets-1-lb/
+# this resource mentions 1-2 lb/acre seeding rate for sugar beets https://hort.purdue.edu/newcrop/afcm/sugarbeet.html
+input_2 <- input_2 %>%
+  mutate(seeding_rate_lbs_per_acre = case_when(
+    crop == "Potatoes" ~ 2400, # Middle range of EPA report. 2,100 to 2,700 lb/acre.
+    crop == "Sugar beets" ~ 5.5, # units here are lb/acre
+    TRUE ~ seeding_rate_lbs_per_acre
+  ))
+
+# Potato chemicals and fertilizers have a serious data anomaly for years 1996, 1996 and 1996, respectively
+# Potato production experts were consulted and it was decided that these USDA NASS values are erroneous
+# What we are doing below is to delete the erroneous values, and let the interpolation fill these values at the end of Step 3 processing using the data from the year before and after the anomalies
+input_2 <- input_2 %>%
+  mutate(chemical_fumigant = ifelse(crop == "Potatoes" & year %in% c(1996, 1998),
+                                         NA,
+                                         chemical_fumigant),
+         chemical_fungicide = ifelse(crop == "Potatoes" & year %in% c(1996, 1998),
+                                    NA,
+                                    chemical_fungicide),
+         chemical_herbicide = ifelse(crop == "Potatoes" & year %in% c(1996, 1998),
+                                     NA,
+                                     chemical_herbicide),
+         chemical_insecticide = ifelse(crop == "Potatoes" & year %in% c(1996, 1998),
+                                     NA,
+                                     chemical_insecticide),
+         fertilizer_nitrogen = ifelse(crop == "Potatoes" & year %in% c(1996),
+                                     NA,
+                                     fertilizer_nitrogen),
+         fertilizer_phosphate = ifelse(crop == "Potatoes" & year %in% c(1996),
+                                     NA,
+                                     fertilizer_phosphate),
+         fertilizer_potash = ifelse(crop == "Potatoes" & year %in% c(1996),
+                                     NA,
+                                     fertilizer_potash))
+```
+
+## 03 FRIS
+
+```{r fris_processing}
+# Irrigated vs non-irrigated acres and yields
+# egc note 08/10/2021. Kathy used yield_harvested and acres_harvested rather than yield_planted and acres_planted to be consistent with FRIS/IWMS data, which reports acres harvested. We talked about it with Allison on 08/10/2021
+
+# get years where FRIS is available
+fris <- input_2 %>% 
+  filter(!is.na(yield_irrigated)) %>% 
+  select(year, crop, yield_harvested, acres_harvested,
+         yield_irrigated, yield_non_irrigated, acres_irrigated, acres_non_irrigated) %>% 
+  mutate(acres_harvested_fris = acres_irrigated + acres_non_irrigated) # check total harvested acres from FRIS against total harvested acres from NASS Quick Stats - numbers differ by order of magnitude, because FRIS includes only farms that use irrigation?
+
+# calculate ratios
+fris_2 <- fris %>%
+  mutate(ratio_yield_irrigated = yield_irrigated / yield_harvested,
+         ratio_yield_non_irrigated = yield_non_irrigated / yield_harvested,
+         ratio_acres_irrigated = acres_irrigated / acres_harvested) %>% 
+  group_by(crop) %>% 
+  arrange(year) %>% 
+  # calculate 4-year average ratios
+  mutate(ratio_yield_irrigated_lag = lag(ratio_yield_irrigated),
+         ratio_yield_non_irrigated_lag = lag(ratio_yield_non_irrigated),
+         ratio_acres_irrigated_lag = lag(ratio_acres_irrigated),
+         avg_ratio_yield_irrigated = (ratio_yield_irrigated + ratio_yield_irrigated_lag)/2,
+         avg_ratio_yield_non_irrigated = (ratio_yield_non_irrigated + ratio_yield_non_irrigated_lag)/2,
+         avg_ratio_acres_irrigated = (ratio_acres_irrigated + ratio_acres_irrigated_lag)/2) %>% 
+  # use average ratio for all intermediate years in the 5-year period, starting with 1984
+  complete(year = 1984:2018, crop) %>% 
+  fill(avg_ratio_yield_irrigated, avg_ratio_yield_non_irrigated, avg_ratio_acres_irrigated, .direction = "up") %>% 
+  # for 2014-2018, use the most recent 5-year average ratio (2008-2013)
+  fill(avg_ratio_yield_irrigated, avg_ratio_yield_non_irrigated, avg_ratio_acres_irrigated, .direction = "down") %>% 
+  select(year, crop, starts_with("avg_ratio"))
+
+# Update 2021-09-30
+# The processing in this chunk only helps sugar beets
+# Allison and I decided to use simple linear interpolation for the rest of the crops, the trends look cleaner
+
+fris_2_sugarbeets_only <- fris_2 %>% 
+  filter(crop == "Sugar beets")
+
+# Using the ratios from the previous step to fill up where needed
+input_3 <- input_2 %>% 
+  left_join(fris_2_sugarbeets_only, by = c("year", "crop")) %>% 
+  # estimate irrigated vs non-irrigated acres/yields using average ratios
+  mutate(yield_irrigated = ifelse(is.na(yield_irrigated), 
+                                  yield_harvested * avg_ratio_yield_irrigated, 
+                                  yield_irrigated),
+         yield_non_irrigated = ifelse(is.na(yield_non_irrigated), 
+                                      yield_harvested * avg_ratio_yield_non_irrigated, 
+                                      yield_non_irrigated),
+         acres_irrigated = ifelse(is.na(acres_irrigated), 
+                                  acres_harvested * avg_ratio_acres_irrigated, 
+                                  acres_irrigated)) #%>% 
+  # for 1980-1984, use 1984 values (these are not estimated using ratios)
+  #group_by(crop) %>% 
+  #arrange(year) %>% 
+  #fill(yield_irrigated, yield_non_irrigated, acres_irrigated, .direction = "up")
+```
+
+## 03 Fill-In Tillage
+
+```{r fill_tillage}
+# 04/09/2021 This is no longer correct, I have created composite tillage share variables
+# Tillage
+# for now, use CTIC CRM data - no, this is primitive
+# input_4 <- input_3 %>% 
+#   mutate(tillage_no_till = ctic_crm_conservation_no_till,
+#          tillage_reduced_till = sum(ctic_crm_reduced_till, ctic_crm_conservation_mulch_till, ctic_crm_conservation_ridge_till, na.rm = TRUE),
+#          tillage_conventional_till = ctic_crm_conventional_till) %>% 
+#   # delete unused variables
+#   select(-starts_with("ctic_crm"), starts_with("arms_"))
+```
+
+## 03 Fill-In Manure
+
+```{r fill_manure}
+# Manure
+# egc 03/17/2021 - already added
+```
+
+## 03 Fill-in Everything Else
+
+```{r fill_everything}
+# Everything else:
+# - Linearly interpolate between data points
+# - Fill in missing values at either end with the closest available value
+input_4 <- input_3 %>% 
+  # calculate percent irrigated using wells
+  mutate(pct_wells = acre_wells/acres_irrigated) %>% 
+  mutate(across(starts_with("chemical_"),
+                .fns = list(rate_per_acre = ~ ./acres_planted),
+                .names = "{fn}_{col}")) %>% 
+  mutate(across(starts_with("fertilizer_"),
+                .fns = list(rate_per_acre = ~ ./acres_planted),
+                .names = "{fn}_{col}")) %>% 
+  mutate(across(where(is.numeric), ~na_if(., 0))) %>% 
+  # delete unnecessary variables
+  select(-acres_non_irrigated)
+
+# More important processing and variable selection. Revise script with addition of new columns
+input_5 <- input_4 %>% 
+  group_by(crop) %>% 
+  arrange(year) %>% 
+  # linearly interpolate between data points using zoo::na.approx
+  mutate_all(na.approx, na.rm = FALSE) %>%
+  # fill in values at two ends with the closest available value
+  fill(everything(), .direction = "up") %>% # can we use .fns like above to get new variables with filled data?
+  fill(everything(), .direction = "down") %>% # same as above
+  mutate(across(starts_with("rate_per_acre"),
+                .fns = list(totals_ = ~ .*acres_planted),
+                .names = "{fn}_{col}")) %>%
+  # remove unnecessary variables
+  select(-c(chemical_fumigant:fertilizer_potash, rate_per_acre_chemical_fumigant:rate_per_acre_fertilizer_potash))
+  #select(1:17, 26:45, 49, 58:65) # watch out for this! I already tripped multiple times here - egc - 04/19/2021
+
+#View(names(input_5))
+
+names(input_5) <- str_remove_all(string = names(input_5), pattern = "totals__rate_per_acre_")
+
+# Note about manure. I don't think it's appropriate to give manure data the same processing as for chemical protection products and fertilizers. The ARMS manure data doesn't show that manure applications have a clear trend to adjust according to the crop acreage for a given year. The manure data gets interpolated between years, and filled up and down with the first and last values for an entire crop series.
+```
+
+## 03 Save Output 03
+
+```{r saving_output_03}
+# Save
+indicators_input_filled <- input_5
+
+save(indicators_input_filled, file = "r_data/outputs_03_egc.rda")
+```

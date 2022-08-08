@@ -1,0 +1,248 @@
+---
+title: "NIR Processing"
+author: "Eric Coronel"
+date: "3/25/2021"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+# R Packages And Other Global Options
+
+library(tidyverse)
+library(readxl)
+library(usdarnass)
+library(zoo)
+
+nass_set_key("40DCDA93-B5E8-33FB-B96F-47902CD5E5A0") # for NASS API queries
+options(scipen = 999)
+
+# Custom Functions
+
+coronel_qc <- function(data, batch_name = "_regular") {
+  
+  vector_names <- names(data) %>% 
+    tail(n = length(names(data)) - 2)
+  
+  for (i in 1:length(vector_names)) {
+    graph01 <- ggplot(data, aes(x = year, y = get(vector_names[i]), group = crop)) +
+      geom_line() +
+      geom_point() +
+      labs(title = paste(vector_names[i]), y = paste(vector_names[i])) +
+      facet_wrap(~ crop, scales = "free") +
+      geom_blank(aes(y = 0))
+    
+    print(paste(vector_names[i], "-", i, "out of", length(vector_names)))
+    ggsave(plot = graph01, filename = paste0("temp_qc_output/", str_pad(i, 2, pad = "0"), "_", vector_names[i],
+                                             batch_name, ".png"))
+  }
+}
+
+coronel_one_off_graph <- function(data, x, y) {
+  ggplot(data, aes(get(x), get(y))) +
+  geom_point() +
+  facet_wrap(~ crop, scales = "free") +
+      geom_blank(aes(y = 0))
+}
+
+coronel_loess <- function(data, x, y) {
+  ggplot(data, aes(get(x), get(y), group = crop)) +
+  geom_point() +
+  geom_line() +
+  geom_smooth(method = "loess", se = F) +
+  facet_wrap(~ crop, scales = "free") +
+      geom_blank(aes(y = 0))
+}
+
+```
+
+
+# 05 Dataframes For Shiny App
+
+```{r shiny}
+
+# Load indicators
+load("r_data/outputs_04_egc.rda")
+
+# Importing ref table for the many components and units
+indicators_components <- read_excel("data_references/indicators and components.xlsx")
+
+# Layout for shiny
+# The major indicators
+# then partitioned by crops and categories, values and proportions
+
+# Main indicators
+vector_main_indicators <- indicators_components %>% 
+  filter(indicator_type %in% c("Energy_Indicators_Unadjusted", "Energy_Indicators_Adjusted",
+                               "Emissions_Indicators_Unadjusted", "Emissions_Indicators_Adjusted")) %>% 
+  select(-indicator_type)
+
+vector_main_indicators <- as.vector(as.matrix(vector_main_indicators))
+vector_main_indicators <- c("land_use_fp", "irrigation_water_use_fp", "erosion_rate_tons_acre", "production",
+                            "acres_planted", vector_main_indicators)
+
+one_million <- 1000000
+
+# For scatter plots and trends, with year in X-axis and indicators in Y-axis, simple stuff
+shiny_main_indicators <- NIR_calculated %>% 
+  select(year, crop, all_of(vector_main_indicators)) %>% 
+  rename(
+    "Acres Planted" = acres_planted,
+    "BTU/acre (adjusted)" = BTUs_per_acre_adjusted,
+    "BTU/acre (unadjusted)" = BTUs_per_acre_unadjusted,
+    "BTU/yield unit (adjusted)" = BTUs_per_yield_unit_adjusted,
+    "BTU/yield unit (unadjusted)" = BTUs_per_yield_unit_unadjusted,
+    "CO2e/acre (adjusted)" = CO2e_per_acre_adjusted,
+    "CO2e/acre (unadjusted)" = CO2e_per_acre_unadjusted,
+    "CO2e/yield unit (adjusted)" = CO2e_per_yield_unit_adjusted,
+    "CO2e/yield unit (unadjusted)" = CO2e_per_yield_unit_unadjusted,
+    "Soil Erosion (tons/acre)" = erosion_rate_tons_acre,
+    "Irrigation Water Use" = irrigation_water_use_fp,
+    "Land Use" = land_use_fp,
+    "Production (yield units)" = production,
+    "Total Energy Use (adjusted)" = total_BTUs_adjusted,
+    "Total Energy Use (unadjusted)" = total_BTUs_unadjusted,
+    "Total GHG Emissions (adjusted)" = total_CO2e_adjusted,
+    "Total GHG Emissions (unadjusted)" = total_CO2e_unadjusted
+  ) %>% 
+  mutate("Acres Planted (Millions)" = `Acres Planted` / one_million,
+         "Production (Million Yield Units)" = `Production (yield units)` / one_million,
+         "BTU/Acre (Millions)" = `BTU/acre (adjusted)` / one_million
+         )
+
+# Components expressed in per-acre basis
+# Filtering out unadjusted variables and the residue removal credit
+vector_per_acre <- indicators_components %>% 
+  filter(indicator_type %in% c("Energy", "Emissions")) %>% 
+  filter(!per_acre %in% c("chemicals_BTUs_per_acre", 
+                          "fertilizer_BTUs_per_acre", 
+                          "irrigation_CO2e_per_acre",
+                          "drying_CO2e_per_acre",
+                          "chemicals_CO2e_per_acre", 
+                          "fertilizer_CO2e_per_acre",
+                          "residue_removal_credit_CO2e_per_acre")) %>% 
+  pull(per_acre)
+
+shiny_per_acre <- NIR_calculated %>% 
+  select(year, crop, all_of(vector_per_acre))
+
+shiny_per_acre_long <- shiny_per_acre %>% 
+  gather(key = "attribute",
+         value = "value",
+         -c(year, crop)) %>% 
+  ungroup() %>% 
+  mutate(type = ifelse(str_detect(attribute, "BTU"),
+                       "Energy",
+                       "GHG")) %>% 
+  group_by(year, crop, type) %>% 
+  mutate(proportion = value/sum(value)) %>%
+  ungroup()
+
+# Components expressed in per-yield-unit basis
+vector_per_yield_unit <- indicators_components %>% 
+  filter(indicator_type %in% c("Energy", "Emissions")) %>% 
+  filter(!per_yield_unit %in% c("chemicals_BTUs_per_yield_unit", 
+                                "fertilizer_BTUs_per_yield_unit",
+                                "irrigation_CO2e_per_yield_unit",
+                                "drying_CO2e_per_yield_unit",
+                                "chemicals_CO2e_per_yield_unit",
+                                "fertilizer_CO2e_per_yield_unit",
+                                "residue_removal_credit_CO2e_per_yield_unit")) %>% 
+  pull(per_yield_unit)
+
+shiny_per_yield_unit <- NIR_calculated %>% 
+  select(year, crop, all_of(vector_per_yield_unit))
+
+shiny_per_yield_unit_long <- shiny_per_yield_unit %>% 
+  gather(key = "attribute",
+         value = "value",
+         -c(year, crop)) %>% 
+  ungroup() %>% 
+  mutate(type = ifelse(str_detect(attribute, "BTU"),
+                       "Energy",
+                       "GHG")) %>% 
+  group_by(year, crop, type) %>% 
+  mutate(proportion = value/sum(value)) %>%
+  ungroup()
+
+# Fertilizers and crop protectants
+ag_inputs_tillage <- NIR_calculated %>% 
+  mutate(n_rate = fertilizer_nitrogen / acres_planted,
+         p_rate = fertilizer_phosphate / acres_planted,
+         k_rate = fertilizer_potash / acres_planted,
+         herb_rate = chemical_herbicide / acres_planted,
+         insect_rate = chemical_insecticide / acres_planted,
+         fung_rate = chemical_fungicide / acres_planted,
+         fumi_rate = chemical_fumigant / acres_planted,
+         growth_rate = chemical_growth_reg / acres_planted) %>% 
+  select(year, crop, 
+         manure_N_lbs_per_acre, manure_rate_all_acreage,
+         conventional_till_share, reduced_till_share, no_till_share,
+         water_applied_acre_inches,
+         n_rate:growth_rate)
+
+# Exporting final data frame for Shiny app
+save(shiny_main_indicators,
+     #shiny_per_acre,
+     shiny_per_acre_long,
+     #shiny_per_yield_unit,
+     shiny_per_yield_unit_long,
+     ag_inputs_tillage,
+     file = "app/outputs_for_ShinyApp_egc.rda")
+```
+
+# Exporting Excel files by crop. Allison will distribute the data by request.
+
+```{r}
+library(xlsx)
+
+# Exporting main indicators, some components, per yield unit and per acre
+
+my_crops_vector <- sort(unique(NIR_calculated$crop))
+
+excel_variables_to_keep <- readxl::read_excel("data_references/vector_for_data_export.xlsx", sheet = 1)
+
+my_variables_to_keep <-  excel_variables_to_keep$variables_to_keep
+
+my_new_names <- excel_variables_to_keep$new_names
+
+for (k in 1:length(my_crops_vector)) {
+  
+  df_export <- NIR_calculated %>% 
+    filter(crop == my_crops_vector[k]) %>% 
+    select(all_of(my_variables_to_keep)) %>%
+    mutate_at(.vars = c(3), .funs = ~ round(.x, 6)) %>% 
+    mutate_at(.vars = c(4), .funs = ~ round(.x, 4)) %>% 
+    mutate_at(.vars = c(5:49), .funs = ~ round(.x, 2))
+
+  names(df_export) <- my_new_names
+  
+  if (my_crops_vector[k] != "Rice") {
+    df_export <- df_export %>% 
+      select(-c(`Methane GHG Emissions (lb CO2e/acre)`, `Methane GHG Emissions (lb CO2e/yield unit)`))
+  }
+  
+  write.xlsx(as.data.frame(df_export), 
+             file = paste0("data_outputs_to_share/", my_crops_vector[k], " 2021 National Indicators Report Data.xlsx"),              sheetName = "Sheet1", col.names = TRUE, row.names = FALSE, append = FALSE)
+  
+  Sys.sleep(1)
+
+}
+
+# verifying file dimensions, rice is different, it has 2 methane variables
+
+my_files <- list.files("data_outputs_to_share/")
+
+for (q in 1:11) {
+  
+  value <- readxl::read_excel(paste0("data_outputs_to_share/", (my_files[q]))) %>% dim()
+  
+  print(value)
+
+}
+
+```

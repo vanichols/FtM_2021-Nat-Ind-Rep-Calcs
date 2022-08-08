@@ -1,0 +1,578 @@
+---
+title: "NIR Processing"
+author: "Eric Coronel and Gina Nichols"
+date: "3/25/2021, gn-6/16/2022"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+# R Packages And Other Global Options
+
+library(tidyverse)
+library(readxl)
+library(usdarnass)
+library(zoo)
+
+nass_set_key("40DCDA93-B5E8-33FB-B96F-47902CD5E5A0") # for NASS API queries
+options(scipen = 999)
+
+# Custom Functions
+
+coronel_qc <- function(data, batch_name = "_regular") {
+  
+  vector_names <- names(data) %>% 
+    tail(n = length(names(data)) - 2)
+  
+  for (i in 1:length(vector_names)) {
+    graph01 <- ggplot(data, aes(x = year, y = get(vector_names[i]), group = crop)) +
+      geom_line() +
+      geom_point() +
+      labs(title = paste(vector_names[i]), y = paste(vector_names[i])) +
+      facet_wrap(~ crop, scales = "free") +
+      geom_blank(aes(y = 0))
+    
+    print(paste(vector_names[i], "-", i, "out of", length(vector_names)))
+    ggsave(plot = graph01, filename = paste0("temp_qc_output/", str_pad(i, 2, pad = "0"), "_", vector_names[i],
+                                             batch_name, ".png"))
+  }
+}
+
+coronel_one_off_graph <- function(data, x, y) {
+  ggplot(data, aes(get(x), get(y))) +
+  geom_point() +
+  facet_wrap(~ crop, scales = "free") +
+      geom_blank(aes(y = 0))
+}
+
+coronel_loess <- function(data, x, y) {
+  ggplot(data, aes(get(x), get(y), group = crop)) +
+  geom_point() +
+  geom_line() +
+  geom_smooth(method = "loess", se = F) +
+  facet_wrap(~ crop, scales = "free") +
+      geom_blank(aes(y = 0))
+}
+
+```
+
+
+# Step 04 - Calculating Metrics
+
+Here we are!
+
+## 04 Load data
+
+```{r load_output_03}
+
+load("r_data/outputs_03_egc.rda")
+
+```
+
+## 04 Metrics Calculations
+
+```{r calculating_metrics}
+
+# Crop vector for reference
+crops <- unique(indicators_input_filled$crop)
+
+# Importing factors (this probably will need many updates - egc 04/12/2021)
+factors <- read_excel("raw_data/conversion_factors.xlsx", sheet = "data") %>% 
+  rename_all(~ (paste0("c_",.))) %>% 
+  rename(crop = c_crop)
+
+# Constants, other factors
+gal_diesel_to_BTU <- 138490
+gal_diesel_to_CO2 <- 22.4 # https://www.eia.gov/environment/emissions/co2_vol_mass.php
+nitrogen_btu_lb <-  27119 # updated 07/06/2021
+nitrogen_co2_lb <- 3.04 # updated 07/06/2021
+phosphorus_btu_lb <-  13212 # updated 07/06/2021
+phosphorus_co2_lb <- 1.88 # updated 07/06/2021
+potassium_btu_lb <-   3484 # updated 07/06/2021
+potassium_co2_lb <- 0.52 # updated 07/06/2021
+application_pass_btu <- round(138490 * 0.1285)
+n2o_emissions_factor <- 1/100 # old factor, only being used for residue removal credit
+
+# Below are direct conversions from Audsley 2009
+# MJ/kg ai are converted to BTU/lb ai by multiplying by (947.8/2.20462)
+# 1 MJ to BTU	947.8
+# 1 kg to lb	2.20462
+
+c_herbicide_btu_lb <- 165947
+c_insecticide_btu_lb <- 117797
+c_fungicide_btu_lb <- 181854
+c_growth_reg_btu_lb <- 118657
+c_fumigant_btu_lb <- 165947 # same as herbicide
+
+# lb CO2e/lb ai are obtained as Audsley 2009 suggested
+# A factor of 0.069 kg CO2 equivalent per MJ pesticide energy can be used to convert these to the Global Warming Potential (100 years). Since the units are kg CO2e/kg ai, it's the same as lb CO2e/lb ai
+
+c_herbicide_co2e_lb <- 26.63
+c_insecticide_co2e_lb <- 18.91
+c_fungicide_co2e_lb <- 29.19
+c_growth_reg_co2e_lb <- 19.04
+c_fumigant_co2e_lb <- 26.63 # same as herbicide
+
+input <- indicators_input_filled %>% 
+  filter(!crop == "Cotton")
+
+# Very important step, all NAs converted to 0 to be able to complete row sums
+# Let's keep an eye open for unintended consequences
+input[is.na(input)] <- 0
+
+input_2 <- input %>% 
+  # Creating water applied in acre inches instead of acre feet
+  mutate(water_applied_acre_inches = water_applied * 12) %>%
+  # Creating delta for irrigated - non-irrigated yield
+  mutate(yield_irrigation_delta = yield_irrigated - yield_non_irrigated,
+         production_irrigation_delta = acres_irrigated * yield_irrigation_delta) %>% 
+  # Merging with multipliers and other important factors
+  left_join(factors, by = "crop")
+
+# Calculating the rest of the metrics
+input_3 <- input_2 %>% 
+  mutate(
+    
+    #### land use ####
+    
+    # unit: acre planted per unit of crop
+    land_use_fp = 1 / yield_planted,
+    
+    #### irrigation water use ####
+    # unit: inches of water per unit increase in yield (due to irrigation)
+    irrigation_water_use_fp = water_applied_acre_inches / yield_irrigation_delta,
+    
+    #### tillage, management energy ####
+    
+    # unit: lbs of CO2e per acre
+    # conversion: kg to pound (2.204), hectare to acre (1/2.471), and C to CO2 (44/12)
+    emissions_conventional_till = conventional_till_share * c_emissions_conventional_till * 
+      (2.204 / 2.471) * (44 / 12),
+    emissions_reduced_till = reduced_till_share * c_emissions_reduced_till * 
+      (2.204 / 2.471) * (44 / 12),
+    emissions_no_till = no_till_share * c_emissions_no_till * 
+      (2.204 / 2.471) * (44 / 12),
+    
+    # unit: lbs of CO2e per acre
+    emissions_tillage = emissions_conventional_till + emissions_reduced_till + emissions_no_till,
+    
+    #manure_per_acre = manure_total / acres_planted, # already calculated as manure_rate_all_acreage
+    
+    # unit: gallons of diesel per acre
+    # conversion: unknown source (0.0287 = standard factor, 3 = 3 times as much energy as a non-manure pass)
+    energy_use_manure_gal_diesel = manure_rate_all_acreage * 0.0287 * 3,
+    
+    # unit: gallons of diesel per acre
+    energy_use_tillage_gal_diesel = emissions_tillage / gal_diesel_to_CO2,
+    
+    # unit: gallons of diesel per acre
+    energy_use_machinery_gal_diesel = energy_use_tillage_gal_diesel + energy_use_manure_gal_diesel,
+    
+    # unit: BTUs per acre
+    management_BTUs_per_acre = energy_use_machinery_gal_diesel * gal_diesel_to_BTU,
+    
+    # unit: CO2e per acre
+    management_CO2e_per_acre = energy_use_machinery_gal_diesel * gal_diesel_to_CO2,
+    
+    # unit: total BTUs
+    management_total_BTUs = management_BTUs_per_acre * acres_planted,
+    
+    # unit: total CO2e
+    management_total_CO2e = management_CO2e_per_acre * acres_planted,
+    
+    #### Irrigation calculations - egc ####
+    
+    # unit: psi
+    avg_pressure = pct_wells * pressure_wells_all_crops + (1 - pct_wells) * pressure_wells_all_crops,
+    
+    # unit: feet
+    avg_lift = pct_wells * depth_wells_all_crops + (1 - pct_wells) * lift_non_wells_all_crops,
+   
+    # conversion: feet to inch (12), inch to mm (1/25.4), other factors unknown (standard engineering equation?)
+    # PSI to meters head/psi (ME) = .703448
+    # feet to meters (FM) = 0.3048 
+    # I suspect the number 804.2 is a BTU to MJ conversion, maybe. Not sure.
+    # unit: gallons of diesel per acre
+    #energy_use_irrigation_gal_diesel_per_acre = (avg_pressure * 0.703448 + avg_lift * 0.3048) *
+    #  (water_applied_acre_inches * 25.4) / 804.2,
+    
+    # units: total gallons of diesel
+    #energy_use_irrigation_total_gal_diesel = energy_use_irrigation_gal_diesel_per_acre * acres_irrigated,
+    
+    # units: total emissions in CO2e
+    #irrigation_total_CO2e = energy_use_irrigation_total_gal_diesel * gal_diesel_to_CO2,
+    
+    #irrigation_CO2e_per_acre = irrigation_total_CO2e / acres_irrigated,
+    
+    # Here we can adjust the emissions with the electricity grid factor
+    #irrigation_total_CO2e_grid_adjusted = irrigation_total_CO2e * egrid_efficiency_ratio,
+    
+    #irrigation_CO2e_grid_adjusted_per_acre = irrigation_total_CO2e_grid_adjusted / acres_irrigated,
+    
+    # units: total BTUs
+    #irrigation_total_BTUs = energy_use_irrigation_total_gal_diesel * gal_diesel_to_BTU,
+    
+    #irrigation_BTUs_per_acre = irrigation_total_BTUs / acres_irrigated,
+    
+    # total acre inches, I don't think we use this
+    #irrigation_total_water = water_applied_acre_inches * acres_irrigated,
+    
+    # Irrigation method updated, using the same method as with the current metrics for irrigation energy and GHGs
+    # Calculations based on equations 19.1, 19.2 and table 19.1 on pages 723&724 of: Hoffman, G.J., T.A. Howell, and
+    #K.H. Solomon. 1992. Management of Farm Irrigation Systems, ASAE Monograph Number 9
+    # BTUs and CO2 per fuel are from https://www.eia.gov/environment/emissions/co2_vol_mass.php and
+    # https://afdc.energy.gov/files/u/publication/fuel_comparison_chart.pdf
+    # See Irrigation Energy Use Metrics documentation for formula details
+    # I also changed acres_irrigated to acres_planted, a departure from 2016 NIR for the per_acre variables
+    irrigation_head = ((avg_pressure / 0.145) * 0.102) + (avg_lift * 0.3048),
+    
+    # Total BTUs
+    irrigation_total_BTUs = (((irrigation_head * 0.0979) * (water_applied_acre_inches * 25.4) *
+                              (acres_irrigated * 0.404686)) / (0.75 * 1 * 0.95 * 1)) * 948,
+    irrigation_BTUs_per_acre = irrigation_total_BTUs / acres_planted,
+
+    # Total CO2e adjusted by eGRID efficiency, power source and their corresponding coefficients
+    irrigation_total_CO2e_grid_adjusted = (((((irrigation_total_BTUs * irrigation_electricity_acres_fraction) /
+                                                3412) * 1.12) * egrid_efficiency_ratio) + # electricity
+      (((irrigation_total_BTUs * irrigation_diesel_acres_fraction) / gal_diesel_to_BTU) * gal_diesel_to_CO2) + # diesel
+      (((irrigation_total_BTUs * irrigation_gasoline_acres_fraction) / 124340) * 19.6) + # gasoline
+      (((irrigation_total_BTUs * irrigation_naturalgas_acres_fraction) / 1026) * 0.117) + # natural gas
+      (((irrigation_total_BTUs * irrigation_propane_acres_fraction) / 91420) * 12.7)), # propane
+    
+    irrigation_CO2e_grid_adjusted_per_acre = irrigation_total_CO2e_grid_adjusted / acres_planted,# change here
+    
+    # Unadjusted values for completion
+    irrigation_total_CO2e = (((((irrigation_total_BTUs * irrigation_electricity_acres_fraction) /
+                                                3412) * 1.12)) + # electricity
+      (((irrigation_total_BTUs * irrigation_diesel_acres_fraction) / gal_diesel_to_BTU)*gal_diesel_to_CO2) + # diesel
+      (((irrigation_total_BTUs * irrigation_gasoline_acres_fraction) / 124340) * 19.6) + # gasoline
+      (((irrigation_total_BTUs * irrigation_naturalgas_acres_fraction) / 1026) * 0.117) + # natural gas
+      (((irrigation_total_BTUs * irrigation_propane_acres_fraction) / 91420) * 12.7)), # propane
+    
+    irrigation_CO2e_per_acre = irrigation_total_CO2e / acres_planted,
+    
+    #### drying ####
+    # unit: total BTUs
+    # Identify crop, drying system used and points of moisture removed
+    # Use Table 11 to look up pounds of water removed per unit yield (e.g. 1.33 lbs water per bu)
+    # Calculate water removed (lbs) by multiplying Table 11 value by production (Yield * Area)
+    # Calculate total energy: multiply total water removed by drying season thermal efficiency (BTU/lb water) from         Table 10
+    # PHE = total BTU/field area
+    # For common crops, we are assuming drying method In bin - combination high temperature and air with 75/25 fuel/electric
+
+    drying_total_BTUs = case_when(
+      crop %in% c("Barley", "Corn, grain", "Rice", "Sorghum", "Soybeans", "Wheat") ~ 
+        c_lb_water_removed * production * 1200,
+      # 300 BTUs for normal moisture, 293 extra BTUs requested by Cotton, 83% lint factor will be applied at the end
+      crop == "Cotton" ~ production * (300 + 293), # * 0.83
+      crop == "Peanuts" ~ (production * (((62618 * c_pts_moisture_removed) - 578344) / 2000)) + 
+        (production * ((((2.991 * c_pts_moisture_removed) - 27.7) / 2000) * 3412.14)), # peanut has two parts
+      crop == "Potatoes" ~ 3050 * production, # 3050 BTUs/cwt for ventilation in storage, see 2016 report
+      crop %in% c("Corn, silage", "Sugar beets") ~ 0#,
+      #TRUE ~ value
+      ),
+    
+    drying_BTUs_per_acre = drying_total_BTUs / acres_planted,
+    
+    drying_total_CO2e = case_when(
+      crop %in% c("Barley", "Corn, grain", "Rice", "Sorghum", "Soybeans", "Wheat") ~ 
+        (((drying_total_BTUs/gal_diesel_to_BTU) * 0.75)*gal_diesel_to_CO2) +  # fuel portion
+        (((drying_total_BTUs/3412) * 0.25)*1.12), # electric portion, 1.12 lb CO2e / kWh national average egrid 2014
+      crop == "Cotton" ~ drying_total_BTUs/gal_diesel_to_BTU * gal_diesel_to_CO2, # regular conversion
+      # 86% of BTUs from peanuts are from propane, the remainder 14% are from electricity
+      crop == "Peanuts" ~ (((drying_total_BTUs * 0.86) / 91420) * 12.7) +
+        (((drying_total_BTUs * 0.14) / 3412) * 1.12), # propane and electricity conversion
+      crop == "Potatoes" ~ drying_total_BTUs/gal_diesel_to_BTU * gal_diesel_to_CO2, # regular conversion
+      crop %in% c("Corn, silage", "Sugar beets") ~ 0#,
+      #TRUE ~ value
+      ),
+    
+    drying_CO2e_per_acre = drying_total_CO2e / acres_planted,
+    
+    # Drying adjusted for CO2 emissions from electrical production portion only
+    #drying_total_CO2e_eGRID_adjusted = drying_total_CO2e * egrid_efficiency_ratio,# this is wrong, only adjust electrical portion
+    
+    drying_total_CO2e_eGRID_adjusted = case_when(
+      crop %in% c("Barley", "Corn, grain", "Rice", "Sorghum", "Soybeans", "Wheat") ~ 
+        (((drying_total_BTUs / gal_diesel_to_BTU) * 0.75) * gal_diesel_to_CO2) +  # fuel portion
+        ((((drying_total_BTUs / 3412) * 0.25) * 1.12) * egrid_efficiency_ratio), # electric portion, 1.12 lb CO2e / kWh national average egrid 2014 and the eGRID adjustment
+      crop == "Cotton" ~ (drying_total_BTUs / gal_diesel_to_BTU) * gal_diesel_to_CO2 * egrid_efficiency_ratio, # regular conversion
+      # 86% of BTUs from peanuts are from propane, the remainder 14% are from electricity
+      crop == "Peanuts" ~ (((drying_total_BTUs * 0.86) / 91420) * 12.7) +
+        ((((drying_total_BTUs * 0.14) / 3412) * 1.12) * egrid_efficiency_ratio), # propane and electricity conversion
+      crop == "Potatoes" ~ drying_total_BTUs/gal_diesel_to_BTU * gal_diesel_to_CO2 * egrid_efficiency_ratio, # regular conversion
+      crop %in% c("Corn, silage", "Sugar beets") ~ 0#,
+      #TRUE ~ value
+      ),
+    
+    drying_CO2e_per_acre_eGRID_adjusted = drying_total_CO2e_eGRID_adjusted / acres_planted,
+    
+    #### chemicals ####
+    
+    # unit: total BTUs, massive number, we'll divide by a million or billion at the very end
+    herbicide_total_BTUs = chemical_herbicide * c_herbicide_btu_lb,
+    insecticide_total_BTUs = chemical_insecticide * c_insecticide_btu_lb,
+    fungicide_total_BTUs = chemical_fungicide * c_fungicide_btu_lb,
+    growth_reg_total_BTUs = chemical_growth_reg * c_growth_reg_btu_lb,
+    fumigant_total_BTUs = chemical_fumigant * c_fumigant_btu_lb,
+
+    chemicals_total_BTUs = (herbicide_total_BTUs + insecticide_total_BTUs + fungicide_total_BTUs +
+                              growth_reg_total_BTUs + fumigant_total_BTUs),
+    
+    chemicals_BTUs_per_acre = chemicals_total_BTUs / acres_planted,
+    
+    chemicals_total_BTUs_global_adjustment = chemicals_total_BTUs * global_energy_efficiency_multiplier,
+    
+    chemicals_BTUs_per_acre_global_adjustment = chemicals_total_BTUs_global_adjustment / acres_planted,
+    
+    # unit: total CO2e, massive number, we'll divide by a million or billion at the very end
+    herbicide_total_CO2e = chemical_herbicide * c_herbicide_co2e_lb,
+    insecticide_total_CO2e = chemical_insecticide * c_insecticide_co2e_lb,
+    fungicide_total_CO2e = chemical_fungicide * c_fungicide_co2e_lb,
+    growth_reg_total_CO2e = chemical_growth_reg * c_growth_reg_co2e_lb,
+    fumigant_total_CO2e = chemical_fumigant * c_fumigant_co2e_lb,
+
+    chemicals_total_CO2e = (herbicide_total_CO2e + insecticide_total_CO2e + fungicide_total_CO2e +
+                              growth_reg_total_CO2e + fumigant_total_CO2e),
+    
+    chemicals_CO2e_per_acre = chemicals_total_CO2e / acres_planted,
+    
+    chemicals_total_CO2e_global_adjustment = chemicals_total_CO2e * CO2_intensity_multiplier,
+    
+    chemicals_CO2e_per_acre_global_adjustment = chemicals_total_CO2e_global_adjustment / acres_planted,
+    
+    #### fertilizers ####
+    
+    # unit: total BTUs, massive number, we'll divide by a million or billion at the very end
+    nitrogen_total_BTUs = fertilizer_nitrogen * nitrogen_btu_lb,
+    phosphorus_total_BTUs = fertilizer_phosphate * phosphorus_btu_lb,
+    potassium_total_BTUs = fertilizer_potash * potassium_btu_lb,
+
+    fertilizer_total_BTUs = (nitrogen_total_BTUs + phosphorus_total_BTUs + potassium_total_BTUs),
+    
+    fertilizer_BTUs_per_acre = fertilizer_total_BTUs / acres_planted,
+    
+    fertilizer_total_BTUs_adjusted = ((nitrogen_total_BTUs * IFA_efficiency_multiplier) + 
+                                        (phosphorus_total_BTUs * global_energy_efficiency_multiplier) +
+                                        (potassium_total_BTUs * global_energy_efficiency_multiplier)),
+    
+    fertilizer_BTUs_per_acre_adjusted = fertilizer_total_BTUs_adjusted / acres_planted,
+    
+    # unit: total CO2e, massive number, we'll divide by a million or billion at the very end
+    nitrogen_total_CO2e = fertilizer_nitrogen * nitrogen_co2_lb,
+    phosphorus_total_CO2e = fertilizer_phosphate * phosphorus_co2_lb,
+    potassium_total_CO2e = fertilizer_potash * potassium_co2_lb,
+
+    fertilizer_total_CO2e = (nitrogen_total_CO2e + phosphorus_total_CO2e + potassium_total_CO2e),
+    
+    fertilizer_CO2e_per_acre = fertilizer_total_CO2e / acres_planted,
+    
+    fertilizer_total_CO2e_adjusted = ((nitrogen_total_CO2e * IFA_efficiency_multiplier) + 
+                                        (phosphorus_total_CO2e * CO2_intensity_multiplier) + 
+                                        (potassium_total_CO2e * CO2_intensity_multiplier)),
+    
+    fertilizer_CO2e_per_acre_adjusted = fertilizer_total_CO2e_adjusted / acres_planted,
+    
+    #### seed ####
+    # unit: million BTUs
+    #energy_use_seed = (energy_use_machinery + energy_use_irrigation + energy_use_drying + energy_use_chemicals +
+    #                     energy_use_fertilizers) * c_seed_input_intensity_factor * c_seed_yield_factor,
+    # I updated with current metrics methods
+    
+    seed_BTUs_per_acre = (seeding_rate_lbs_per_acre / c_wt_lbs) * c_seed_btu_yield_unit,
+    
+    seed_total_BTUs = seed_BTUs_per_acre * acres_planted,
+    
+    seed_CO2e_per_acre = (seeding_rate_lbs_per_acre / c_wt_lbs) * c_seed_CO2e_yield_unit,
+    
+    seed_total_CO2e = seed_CO2e_per_acre * acres_planted,
+
+    #### transportation ####
+    # updated with current metrics methodology 04/16/2021
+    # assumes diesel for fuel, mileage and truck capacity listed in factors data
+    # We are assuming a round-trip with impact of 1.8 instead of 2, to account for fuel efficiency when truck runs #empty in the way back
+    truck_miles_per_gallon = 6.5,
+    truck_round_trip_coeff = 1.8, # 1 trip + 0.8 trip since the truck in return trip comes back empty
+    
+    transportation_total_BTUs = (production / c_truck_capacity_yield_output) * ((c_transportation_distance/truck_miles_per_gallon)*gal_diesel_to_BTU) * truck_round_trip_coeff,
+    
+    transportation_BTUs_per_acre = transportation_total_BTUs / acres_planted,
+    
+    transportation_total_CO2e = transportation_total_BTUs / gal_diesel_to_BTU * gal_diesel_to_CO2,
+    
+    transportation_CO2e_per_acre = transportation_total_CO2e / acres_planted,
+    
+    #### nitrous oxide ####
+    # n2o_emissions_factor is the N2O emissions per lb of nitrogen applied, updated from last report, when it was 0.014
+    # 44/28 = the molecular weight ratio of N2O/N2O-N
+    # Global Warming Potential of N2O = 298, https://www.epa.gov/ghgemissions/overview-greenhouse-gases#N2O-references
+    n2o_CO2e_per_acre_primitive = (((fertilizer_nitrogen/acres_planted) + manure_N_lbs_per_acre) * n2o_emissions_factor * (44/28) * 298),
+    
+    n2o_total_CO2e_primitive = n2o_CO2e_per_acre_primitive * acres_planted, 
+    
+    # updated equations for N2O
+    # Equation 11.1 Direct N2O emissions from managed soils (Tier 1)
+    n2o_eq_11_1_per_acre = ifelse(crop == "Rice",
+                                  #(((fertilizer_nitrogen/acres_planted) + manure_N_lbs_per_acre) * 0.010) + 
+      (((fertilizer_nitrogen/acres_planted) + manure_N_lbs_per_acre) * 0.004),
+                                  ((fertilizer_nitrogen/acres_planted) + manure_N_lbs_per_acre) * 0.010),
+    
+    # Equation 11.9 N2O from atmospheric deposition of N volatilized from managed soils (Tier 1) 11.22, IPCC 2019
+    n2o_eq_11_9_per_acre = (((fertilizer_nitrogen/acres_planted) * 0.11) + (manure_N_lbs_per_acre * 0.21)) * 0.010,
+    
+    # Equation 11.10 N2O from N leaching/runoff from managed soils in regions where leaching/runoff occurs (Tier 1)
+    n2o_eq_11_10_per_acre = (((fertilizer_nitrogen/acres_planted) + manure_N_lbs_per_acre) * 0.24) * 0.011,
+      
+    # Aggregating all three equations above
+    n2o_CO2e_per_acre = (n2o_eq_11_1_per_acre + n2o_eq_11_9_per_acre + n2o_eq_11_10_per_acre) * (44/28) * 298,
+    
+    n2o_total_CO2e = n2o_CO2e_per_acre * acres_planted, 
+    
+    #### residue burning ####
+    ## when divided per acre the number gets highly diluted
+    # This indicator was also updated to match current metrics methodology
+    
+    residue_burning_total_CO2e = acres_planted * (percent_area_burned/100) * yield_planted * c_residue_burning_co2e_lb,
+    
+    residue_burning_CO2e_per_acre = residue_burning_total_CO2e / acres_planted,
+    
+    #### Methane emissions for Rice ####
+    rice_methane_total_CO2e = ifelse(crop == "Rice", 
+                                     methane_CO2e_acre * acres_harvested,
+                                     no = 0),
+    
+    rice_methane_CO2e_per_acre = rice_methane_total_CO2e / acres_planted,
+    
+    ##### Residue removal credit for Wheat and Barley ####
+    # remember to divide acreage share by 100
+    # https://ocj.com/2011/07/determining-the-actual-nutrient-value-of-wheat-straw/
+    # Facts and assumptions about this residue removal credit
+    # Bushel of wheat 60 lbs, bushel of barley 48 lbs
+    # Percent N of straw: 0.005 (0.5 percent)
+    # Grain to straw production ratio: 1 (very conservative value)
+    # Straw production from a bushel of wheat/barley: 60/48 lbs, same as weight of grain (water not included here)
+    # N content from pound of straw/wheat = 0.3 lbs N (60 lbs * 0.005)
+    # N content from pound of straw/barley = 0.24 lb N (48 lbs * 0.005)
+    # Both factors above get divided by 2 (assumption of 50% residue removal)
+    # n2o_emissions_factor is the IPCC N loss factor, just 1% basically
+    # 298 is the warming potential of N2O, https://www.epa.gov/ghgemissions/overview-greenhouse-gases#N2O-references
+    # 44/28 is the Ratio of N2O to N2O-N
+    # The number is made negative to subtract from the final value
+    residue_removal_credit_total_CO2e = case_when(
+      crop == "Wheat" ~ production * (residue_removal_percent_acreage/100) * (0.3/2) * n2o_emissions_factor *
+        298 * (44/28) * -1,
+      crop == "Barley" ~ production * (residue_removal_percent_acreage/100) * (0.24/2) * n2o_emissions_factor *
+        298 * (44/28) * -1,
+      TRUE ~ 0
+    ),
+    
+    # To check impact per acre
+    residue_removal_credit_CO2e_per_acre = residue_removal_credit_total_CO2e / acres_planted,
+    
+    #### Application energy ####
+    application_total_BTUs = total_application_passes * application_pass_btu * acres_planted,
+    
+    application_BTUs_per_acre = application_total_BTUs / acres_planted, 
+    
+    # Application emissions
+    application_total_CO2e = (application_total_BTUs / gal_diesel_to_BTU) * gal_diesel_to_CO2,
+    
+    application_CO2e_per_acre = application_total_CO2e / acres_planted,
+    
+    #### Total BTUs ####
+    total_BTUs_unadjusted = management_total_BTUs + irrigation_total_BTUs + drying_total_BTUs + chemicals_total_BTUs +
+      fertilizer_total_BTUs + seed_total_BTUs + transportation_total_BTUs + application_total_BTUs,
+    # Calculating BTUs per acreage planted
+    #BTUs_per_acre_unadjusted = total_BTUs_unadjusted / acres_planted, # this causes a discrepancy due to irrigation
+    BTUs_per_acre_unadjusted = application_BTUs_per_acre + chemicals_BTUs_per_acre + drying_BTUs_per_acre +
+      fertilizer_BTUs_per_acre + irrigation_BTUs_per_acre + management_BTUs_per_acre + seed_BTUs_per_acre +
+      transportation_BTUs_per_acre, 
+    # Calculating BTUs per yield unit
+    BTUs_per_yield_unit_unadjusted = total_BTUs_unadjusted / production,
+    
+    # Total adjusted
+    total_BTUs_adjusted = management_total_BTUs + irrigation_total_BTUs + drying_total_BTUs +
+      chemicals_total_BTUs_global_adjustment + fertilizer_total_BTUs_adjusted + seed_total_BTUs +
+      transportation_total_BTUs + application_total_BTUs,
+    # Per acre adjusted
+    #BTUs_per_acre_adjusted = total_BTUs_adjusted / acres_planted, # this causes a discrepancy due to irrigation
+    BTUs_per_acre_adjusted = application_BTUs_per_acre + chemicals_BTUs_per_acre_global_adjustment +
+      drying_BTUs_per_acre + fertilizer_BTUs_per_acre_adjusted + irrigation_BTUs_per_acre + management_BTUs_per_acre +
+      seed_BTUs_per_acre + transportation_BTUs_per_acre,
+
+    # Per yield unit adjusted
+    BTUs_per_yield_unit_adjusted = total_BTUs_adjusted / production,
+    
+    #### Total CO2e ####
+    # Notice that we use irrigation_total_CO2e_grid_adjusted, drying_total_CO2e_eGRID_adjusted, chemicals_total_co2e_grid_adjusted, and fertilizer_total_co2e_grid_adjusted to account for eGRID efficiency over time
+    total_CO2e_adjusted = management_total_CO2e + irrigation_total_CO2e_grid_adjusted +
+      drying_total_CO2e_eGRID_adjusted + chemicals_total_CO2e_global_adjustment + fertilizer_total_CO2e_adjusted +
+      n2o_total_CO2e + seed_total_CO2e + transportation_total_CO2e + residue_burning_total_CO2e +
+      rice_methane_total_CO2e + residue_removal_credit_total_CO2e + application_total_CO2e,
+    # Calculating CO2e per acre
+    #CO2e_per_acre_adjusted = total_CO2e_adjusted / acres_planted,# this causes a discrepancy due to irrigation
+    CO2e_per_acre_adjusted = application_CO2e_per_acre + chemicals_CO2e_per_acre_global_adjustment +
+      drying_CO2e_per_acre_eGRID_adjusted + fertilizer_CO2e_per_acre_adjusted + irrigation_CO2e_grid_adjusted_per_acre
+    + management_CO2e_per_acre + n2o_CO2e_per_acre + residue_burning_CO2e_per_acre +
+      residue_removal_credit_CO2e_per_acre + rice_methane_CO2e_per_acre + seed_CO2e_per_acre +
+      transportation_CO2e_per_acre,
+    # Calculating CO2e per yield unit
+    CO2e_per_yield_unit_adjusted = total_CO2e_adjusted / production,
+    
+    # Unadjusted below for comparison
+    total_CO2e_unadjusted = management_total_CO2e + irrigation_total_CO2e + drying_total_CO2e +
+      chemicals_total_CO2e + fertilizer_total_CO2e + n2o_total_CO2e + seed_total_CO2e + transportation_total_CO2e + residue_burning_total_CO2e + rice_methane_total_CO2e + residue_removal_credit_total_CO2e + application_total_CO2e,
+    # Calculating CO2e per acre
+    #CO2e_per_acre_unadjusted = total_CO2e_unadjusted / acres_planted,# this causes a discrepancy due to irrigation
+    CO2e_per_acre_unadjusted = application_CO2e_per_acre + chemicals_CO2e_per_acre + drying_CO2e_per_acre +
+      fertilizer_CO2e_per_acre + irrigation_CO2e_per_acre + management_CO2e_per_acre + n2o_CO2e_per_acre +
+      residue_burning_CO2e_per_acre + residue_removal_credit_CO2e_per_acre + rice_methane_CO2e_per_acre +
+      seed_CO2e_per_acre + transportation_CO2e_per_acre,
+    # Calculating CO2e per yield unit
+    CO2e_per_yield_unit_unadjusted = total_CO2e_unadjusted / production
+    )
+
+# Importing ref table for the many components and units
+indicators_components <- read_excel("data_references/indicators and components.xlsx")
+
+# Pulling vector of totals
+indicators_components_vector <- indicators_components %>% 
+  filter(indicator_type %in% c("Energy", "Emissions")) %>% 
+  pull(totals)
+
+# Calculating per-yield-unit variables
+input_4 <- input_3 %>% 
+  mutate_at(indicators_components_vector,
+            .funs = list(PYU_per_yield_unit = ~ ./production))
+
+# Renaming
+names(input_4) <- str_replace_all(string = names(input_4), pattern = "total_BTUs_PYU", replacement = "BTUs")
+names(input_4) <- str_replace_all(string = names(input_4), pattern = "total_CO2e_PYU", replacement = "CO2e")
+#View(names(input_4))
+
+# More renaming
+input_4 <- input_4 %>% 
+  rename(irrigation_CO2e_grid_adjusted_per_yield_unit = irrigation_total_CO2e_grid_adjusted_PYU_per_yield_unit,
+         chemicals_CO2e_global_adjustment_per_yield_unit = chemicals_total_CO2e_global_adjustment_PYU_per_yield_unit,
+         fertilizer_CO2e_adjusted_per_yield_unit = fertilizer_total_CO2e_adjusted_PYU_per_yield_unit,
+        chemicals_BTUs_global_adjustment_per_yield_unit  = chemicals_total_BTUs_global_adjustment_PYU_per_yield_unit,
+        fertilizer_BTUs_adjusted_per_yield_unit = fertilizer_total_BTUs_adjusted_PYU_per_yield_unit,
+        drying_CO2e_eGRID_adjusted_per_yield_unit = drying_total_CO2e_eGRID_adjusted_PYU_per_yield_unit
+         )
+
+# Checking names
+#View(names(input_4))
+
+# Now run cotton 83 pct allocation.R and create cotton_input_4
+# Final data frame
+NIR_calculated <- input_4 %>% 
+  bind_rows(cotton_input_4)
+
+# Exporting final data frame
+save(NIR_calculated, file = "r_data/outputs_04_egc.rda")
+```
+

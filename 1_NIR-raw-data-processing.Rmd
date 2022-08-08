@@ -1,0 +1,426 @@
+---
+title: "NIR Processing"
+author: "Eric Coronel"
+date: "3/25/2021"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+# R Packages And Other Global Options
+
+library(tidyverse)
+library(readxl)
+library(usdarnass)
+library(zoo)
+
+nass_set_key("40DCDA93-B5E8-33FB-B96F-47902CD5E5A0") # for NASS API queries
+options(scipen = 999)
+
+# Custom Functions
+
+coronel_qc <- function(data, batch_name = "_regular") {
+  
+  vector_names <- names(data) %>% 
+    tail(n = length(names(data)) - 2)
+  
+  for (i in 1:length(vector_names)) {
+    graph01 <- ggplot(data, aes(x = year, y = get(vector_names[i]), group = crop)) +
+      geom_line() +
+      geom_point() +
+      labs(title = paste(vector_names[i]), y = paste(vector_names[i])) +
+      facet_wrap(~ crop, scales = "free") +
+      geom_blank(aes(y = 0))
+    
+    print(paste(vector_names[i], "-", i, "out of", length(vector_names)))
+    ggsave(plot = graph01, filename = paste0("temp_qc_output/", str_pad(i, 2, pad = "0"), "_", vector_names[i],
+                                             batch_name, ".png"))
+  }
+}
+
+coronel_one_off_graph <- function(data, x, y) {
+  ggplot(data, aes(get(x), get(y))) +
+  geom_point() +
+  facet_wrap(~ crop, scales = "free") +
+      geom_blank(aes(y = 0))
+}
+
+coronel_loess <- function(data, x, y) {
+  ggplot(data, aes(get(x), get(y), group = crop)) +
+  geom_point() +
+  geom_line() +
+  geom_smooth(method = "loess", se = F) +
+  facet_wrap(~ crop, scales = "free") +
+      geom_blank(aes(y = 0))
+}
+
+```
+
+# 01 A - Reading Static Data Sources
+
+Here we import all the data previously downloaded by hand.
+Last updated: started updating on 02/22/2021
+Purpose: Import raw files without modification
+Input: all files in raw_data folder
+Output: datasets in r_data/outputs_01_egc.rda
+
+```{r importing_static}
+
+#FRIS Irrigation
+
+fris_irrigation <- read_csv("raw_data/fris_irrigation/fris_irrigation.csv")
+
+# CTIC - CRM Tillage
+
+sheets <- excel_sheets("raw_data/ctic_crm_tillage/ctic_crm_tillage.xlsx")
+
+wb <- list()
+
+for (i in 1:length(sheets)) {
+  wb[[i]] <- read_excel("raw_data/ctic_crm_tillage/ctic_crm_tillage.xlsx", sheets[i])
+}
+
+names(wb) <- sheets
+
+ctic_crm_tillage <- bind_rows(wb, .id = "year")
+
+# CTIC - OpTis Tillage - not in use for NIR, probably for benchmarks - egc 04/06/2021
+
+### NEW DATA AVAILABLE, NEED TO REVISE ###
+#ctic_optis_tillage <- read_csv("raw_data/ctic_optis_tillage/ctic_optis_tillage.csv")
+
+# ARMS Tillage
+
+arms_tillage <- read_csv("raw_data/arms_tillage/arms_tillage.csv")
+
+# ARMS Manure
+
+sheets <- excel_sheets("raw_data/arms_manure/arms_manure.xlsx")
+
+wb <- list()
+
+for (i in 1:length(sheets)) {
+  wb[[i]] <- read_excel("raw_data/arms_manure/arms_manure.xlsx", sheets[i])
+}
+
+names(wb) <- sheets
+
+arms_manure <- bind_rows(wb, .id = "crop")
+
+rm(wb)
+
+# ERS Tillage - egc 04/05/2021
+# deprecated - egc 05/14/2021
+# ers_tillage <- readxl::read_excel(
+#   "raw_data/ers_tillage_intensity/tillage intensity and conservation cropping supporting tables.xlsx",
+#   sheet = 1, skip = 1)
+
+# ERS Seed data - egc 04/06/2021
+
+ers_seed_data <- readxl::read_excel("raw_data/ers_seed_data/ers_seed_data_all_crops.xlsx", sheet = 1)
+
+# Soil Erosion Rates from the USDA National Statistician's Office
+
+# Function to read all files
+crop_files <- list.files(path = "raw_data/NRI17_Erosion", pattern = ".xlsx")
+
+tmp3 <- data.frame()
+
+for (i in 1:length(crop_files)) {
+  
+  tmp1 <- readxl::read_excel(paste0("raw_data/NRI17_Erosion/", crop_files[i]), sheet = 2, skip = 6)
+  
+  crop_sheet <- readxl::read_excel(paste0("raw_data/NRI17_Erosion/", crop_files[i]), sheet = 2, range = "A1:A2")
+  
+  crop_name <- word(crop_sheet$`2017 National Resources Inventory`, -1)
+  
+  tmp2 <- tmp1 %>% 
+    filter(is.na(State) == F) %>% 
+    select(1:3, 15:16) %>% 
+    mutate(crop = crop_name) %>% 
+    rename("state" = 1,
+           "year" = 2,
+           "acreage_thousands" = 3,
+           "erosion_rate" = 4,
+           "erosion_rate_error" = 5)
+  
+  tmp3 <- rbind(tmp3, tmp2)
+}
+
+# Keep National values only
+tmp4 <- tmp3 %>%
+  filter(state == "National")
+
+NRI_soil_erosion <- tmp4
+
+rm(tmp1, tmp2, tmp3, tmp4, crop_files, crop_name, crop_sheet)
+
+# Reading crop residue area burned
+# From EPA GHG inventory and sinks
+
+area_burned <- read_csv("raw_data/EPA_residue_area_burned/EPA_area_burned.csv")
+
+# Creating data frame for rice methane
+# Data from Table 5-11: CH4 Emissions from Rice Cultivation (MMT CO2 Eq.), EPA GHG sinks and inventory report 2019
+# Acreage from Table 5-13: Rice Area Harvested (1,000 Hectares)
+# There are more emissions data points (2015:2019), but not new acreage to match those values unfortunately. Since we need to calculate a rate per acre, having the emissions value only does not help us since we need the denominator of acres. Allison also didn't want to use the planted acreage from NASS, since the EPA sinks report uses National Resources Inventory data.
+# We will later calculate an emissions per acre factor to use for rice methane emissions
+rice_methane_emissions <- data.frame(
+  year = c(1990, 2005, 2015),
+  crop = "Rice",
+  MMT_CO2e = c(16, 18, 16.2),
+  harvested_ha_thousands = c(1707, 1788, 1619)
+)
+
+# Reading egrid efficiency data over time
+# Data were collected from eGRID reports, source file is listed in the dataset below
+# These data will be used to adjust the CO2e emissions of irrigation, fertilizers, pesticides, and maybe potato storage
+egrid_efficiency <- read_csv("raw_data/eGRID_efficiency/egrid_efficiency.csv")
+
+# On 05/05/2021 we received new ERS tillage data
+# We need to re-work the tillage data. The new data received takes precedence over all other data sets
+ers_tillage_2021 <- read_excel("raw_data/ers_2021_tillage/national_table_043021.xlsx")
+
+# Residue removal for wheat and barley
+removal_residue <- read_csv("raw_data/residue_removal_wheat_barley/residue_removal.csv") %>% 
+  select(-data_source)
+
+# Creating a data frame for nitrogen production efficiency
+# Starting blank data set
+N_production_efficiency <- data.frame(
+  year = 1980:2020
+)
+
+# Adding a linear function that results in 30% decrease from 1980 to 2020
+N_production_efficiency <- N_production_efficiency %>% 
+  mutate(value = 672.685 - (0.3183 * year))
+
+# CO2 global intensity to adjust GHG emissions of P, K, and chemical production
+# Creating blank data set
+global_CO2_intensity <- data.frame(
+  year = 1980:2020
+)
+
+years_with_data <- data.frame(
+  year = c(1990, 2018),
+  value = c(529, 475)
+  )
+
+global_CO2_intensity <- global_CO2_intensity %>% 
+  left_join(years_with_data) %>% 
+  # linearly interpolate between data points using zoo::na.approx
+  mutate_all(zoo::na.approx, na.rm = F) %>% 
+  # Fill up and down with the first or last values
+  tidyr::fill(value, .direction = "down") %>% 
+  tidyr::fill(value, .direction = "up")
+
+# Global energy intensity
+# Also to adjust energy use of P, K, and chemical production
+global_energy_intensity <- read_csv("raw_data/IEA_global_energy_efficiency/IEA_global_energy_efficiency.csv")
+
+# egc - 07/13/2021
+# Here I import data from ERS to differentiate corn grain and corn silage
+# Manure tons per acre for corn silage is much higher than for corn grain
+ers_manure_corn_data <- readxl::read_excel("raw_data/ers_manure_corn/manure_use_in_corn.xlsx")
+
+# Adjustment for irrigation power source
+# Data extracted from FRIS Energy Expense for All Well Pumps and Other Irrigation Pumps by Type of Energy Used
+# All data tables back to 1979 have a similar name as above
+fris_irrigation_power_source <- read_csv("raw_data/fris_irrigation/irrigation_power_source.csv")
+```
+
+# 01 B - Running API Queries
+
+For NASS data, we run API queries
+
+```{r importing_queries}
+# NASS land use with API queries
+
+# Batch import for land use data, excluding potatoes
+short_desc_land_use <- read_csv("data_references/short_desc_land_use.csv") %>% 
+  pull(1)
+
+# short_desc_land_use_excl_potatoes <- short_desc_land_use %>% 
+#   filter(str_detect(short_desc, pattern = "POTATOES", negate = T)) %>% # potatoes is a vegetable, not a field crop
+#   pull(1)
+
+nass_lu_data_collector <- data.frame() # keep going here, egc - 05/19/2021
+
+for (i in 1:length(short_desc_land_use)) {
+  
+  tmp1 <- nass_data(source_desc = "SURVEY",
+                    sector_desc = "CROPS",
+                    #group_desc = "FIELD CROPS",
+                    short_desc = short_desc_land_use[i],
+                    domain_desc = "TOTAL",
+                    agg_level_desc = "NATIONAL",
+                    year = ">=1980",
+                    reference_period_desc = "YEAR"
+                    )
+  
+  nass_lu_data_collector <- rbind(nass_lu_data_collector, tmp1)
+  
+  print(paste(i, "out of", length(short_desc_land_use)))
+  print(short_desc_land_use[i])
+  Sys.sleep(0.5)
+}
+
+# Batch import for potatoes
+# short_desc_potatoes <- short_desc_land_use %>% 
+#   filter(str_detect(short_desc, pattern = "POTATOES")) %>% # potatoes is a vegetable, not field crop
+#   pull(1)
+# 
+# data_collector_potatoes <- data.frame()
+# 
+# for (i in 1:length(short_desc_potatoes)) {
+#   
+#   tmp1 <- nass_data(source_desc = "SURVEY",
+#                     sector_desc = "CROPS",
+#                     group_desc = "VEGETABLES",
+#                     short_desc = short_desc_potatoes[i],
+#                     domain_desc = "TOTAL",
+#                     agg_level_desc = "NATIONAL",
+#                     year = ">=1980",
+#                     reference_period_desc = "YEAR"
+#                     )
+#   
+#   data_collector_potatoes <- rbind(data_collector_potatoes, tmp1)
+#   
+#   print(paste(i, "out of", length(short_desc_potatoes)))
+#   print(short_desc_potatoes[i])
+#   Sys.sleep(0.5)
+# }
+
+# Batch import for sucrose percent in sugar beets
+sugarbeets_sucrose_pct <- nass_data(source_desc = "SURVEY",
+          sector_desc = "CROPS",
+          group_desc = "FIELD CROPS",
+          short_desc = "SUGARBEETS - SUCROSE, MEASURED IN PCT",
+          domain_desc = "TOTAL",
+          #agg_level_desc = "NATIONAL",
+          year = ">=1980",
+          reference_period_desc = "YEAR"
+          )
+
+# Binding data
+nass_land_use <- nass_lu_data_collector %>% 
+  mutate(Value = as.numeric(str_remove_all(string = Value, pattern = ",")),
+         year = as.numeric(year)) %>% 
+  select(year, commodity_desc, short_desc, Value) %>% 
+  rename(Year = year,
+         Commodity = commodity_desc,
+         `Data Item` = short_desc)
+
+rm(nass_lu_data_collector, short_desc_land_use, tmp1)
+
+# NASS Chemicals with API queries
+
+short_desc_environmental <- read_csv("data_references/short_desc_environmental.csv") %>% 
+  pull(1)
+
+# short_desc_environmental_excl_potatoes <- short_desc_environmental %>% 
+#   filter(!str_detect(short_desc, pattern = "POTATOES")) %>% 
+#   pull(1)
+
+# all crops except potatoes
+environ_collector <- data.frame()
+
+for (i in 1:length(short_desc_environmental)) {
+  
+  tmp1 <- nass_data(source_desc = "SURVEY",
+                    sector_desc = "ENVIRONMENTAL",
+                    #group_desc = "FIELD CROPS",
+                    short_desc = short_desc_environmental[i],
+                    agg_level_desc = "REGION : MULTI-STATE",
+                    year = ">=1980"
+                    )
+  
+  environ_collector <- rbind(environ_collector, tmp1)
+  
+  print(paste(i, "out of", length(short_desc_environmental)))
+  print(short_desc_environmental[i])
+  Sys.sleep(0.5)
+}
+
+# for potatoes, since it's a vegetable
+
+# short_desc_environmental_potatoes <- short_desc_environmental %>% 
+#   filter(str_detect(short_desc, pattern = "POTATOES")) %>% 
+#   pull(1)
+
+# environ_potatoes <- nass_data(source_desc = "SURVEY",
+#                               sector_desc = "ENVIRONMENTAL",
+#                               group_desc = "VEGETABLES",
+#                               short_desc = short_desc_environmental_potatoes,
+#                               agg_level_desc = "REGION : MULTI-STATE",
+#                               year = ">=1980"
+#                               )
+
+nass_chemicals <- environ_collector %>%
+  #bind_rows(environ_potatoes) %>% 
+  select(year, commodity_desc, short_desc, domain_desc, domaincat_desc, Value) %>% 
+  rename(Year = year,
+         Commodity = commodity_desc,
+         `Data Item` = short_desc,
+         Domain = domain_desc,
+         `Domain Category` = domaincat_desc) %>% 
+  mutate(Value = as.numeric(str_remove_all(string = Value, pattern = ",")),
+         Year = as.numeric(Year))
+
+# Number of passes for application energy and GHG emissions
+num_passes_vector <- read_csv("data_references/num_passes_short_desc.csv") %>% pull(descriptions)
+
+nass_num_passes <- data.frame()
+
+for (i in 1:length(num_passes_vector)) {
+  
+  tmp1 <-  nass_data(source_desc = "SURVEY",
+                     sector_desc = "ENVIRONMENTAL",
+                     #group_desc = "VEGETABLES", # "FIELD CROPS"
+                     short_desc = num_passes_vector[i],
+                     agg_level_desc = "REGION : MULTI-STATE",
+                     year = ">=1980"
+  )
+  
+  nass_num_passes <- rbind(nass_num_passes, tmp1)
+  
+  print(paste(i, "out of", length(num_passes_vector)))
+  print(num_passes_vector[i])
+  Sys.sleep(0.5)
+}
+
+rm(environ_collector, short_desc_environmental, tmp1,
+   i, num_passes_vector, sheets)
+```
+
+# 01 Save 01 Output
+
+```{r saving_output_01}
+save(nass_land_use,
+     nass_chemicals,
+     fris_irrigation,
+     ctic_crm_tillage,
+     #ctic_optis_tillage, - we won't be using OPTIS for the NIR - egc 04/06/2021
+     arms_manure,
+     arms_tillage,
+     #ers_tillage, egc - deprecated 05/14/2021
+     ers_seed_data,
+     NRI_soil_erosion,
+     area_burned,
+     rice_methane_emissions,
+     sugarbeets_sucrose_pct,
+     egrid_efficiency,
+     ers_tillage_2021,
+     removal_residue,
+     nass_num_passes,
+     N_production_efficiency,
+     global_CO2_intensity,
+     global_energy_intensity,
+     ers_manure_corn_data,
+     fris_irrigation_power_source,
+     file = "r_data/outputs_01_egc.rda")
+```
